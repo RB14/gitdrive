@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import logging
 import random
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -31,14 +32,17 @@ class DriveClient:
 
     def __init__(self, credentials: Credentials) -> None:
         self._credentials = credentials
-        self._service: Any | None = None  # lazily initialised
+        # Thread-local storage: httplib2.Http() is NOT thread-safe, so each
+        # thread gets its own Http instance and Drive service object.
+        self._local = threading.local()
 
     # ── Service accessor ─────────────────────────────────────────
 
     @property
     def service(self) -> Any:
-        """Lazily build and return the Drive v3 service resource."""
-        if self._service is None:
+        """Lazily build and return a per-thread Drive v3 service resource."""
+        svc = getattr(self._local, "service", None)
+        if svc is None:
             import google_auth_httplib2
             import httplib2
             from googleapiclient.discovery import build
@@ -46,8 +50,9 @@ class DriveClient:
             http = google_auth_httplib2.AuthorizedHttp(
                 self._credentials, http=httplib2.Http()
             )
-            self._service = build("drive", "v3", http=http)
-        return self._service
+            svc = build("drive", "v3", http=http)
+            self._local.service = svc
+        return svc
 
     # ── Folder operations ────────────────────────────────────────
 
