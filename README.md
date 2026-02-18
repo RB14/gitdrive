@@ -40,7 +40,7 @@ credentials, and tokens are stored locally in `.gitdrive/` (gitignored) — noth
 touches your home directory.
 
 ```bash
-git clone https://github.com/user/gitdrive.git
+git clone https://github.com/RB14/gitdrive.git
 cd gitdrive
 ./gitdrive.sh --help
 ```
@@ -74,7 +74,7 @@ available everywhere. Configuration is stored in standard XDG directories
 (`~/.config/gitdrive/`, `~/.local/share/gitdrive/`).
 
 ```bash
-git clone https://github.com/user/gitdrive.git
+git clone https://github.com/RB14/gitdrive.git
 cd gitdrive
 ./install.sh
 ```
