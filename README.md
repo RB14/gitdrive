@@ -81,7 +81,8 @@ cd gitdrive
 
 This will:
 1. Create a virtual environment at `~/.gitdrive/venv/`
-2. Install GitDrive in editable mode
+2. Install GitDrive in editable mode (source changes take effect immediately
+   without reinstalling)
 3. Place `gitdrive` and `git-remote-gdrive` wrapper scripts in `~/.local/bin/`
 
 If `~/.local/bin` is not on your `PATH`, the installer will print instructions
