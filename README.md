@@ -196,11 +196,11 @@ git pull gdrive main
 ### 5. Clone from Drive (on another machine)
 
 ```bash
-# Clone a repo that was previously pushed to Drive
-gitdrive clone my-project
+# Standard git clone — works if git-remote-gdrive is on PATH
+git clone gdrive://my-project
 
-# Clone into a specific directory
-gitdrive clone my-project ~/projects/my-project-copy
+# Or use the gitdrive wrapper (doesn't require PATH setup)
+gitdrive clone my-project
 ```
 
 ### 6. Change the Browsable Branch
@@ -351,20 +351,25 @@ gitdrive sync
 gitdrive sync --repo my-project
 ```
 
-### `gitdrive clone <name> [directory]`
+### `git clone gdrive://<name>`
 
-Clone a repository from Google Drive into a new local directory. Downloads
-all bundles, applies them, sets up the `gdrive` remote, and checks out the
-browsable branch.
+The native way to clone — uses the remote helper directly. Requires
+`git-remote-gdrive` to be on your `PATH` (automatic with global install).
 
 ```bash
-# Clone into a directory named after the repo
+git clone gdrive://my-project
+git clone gdrive://my-project ~/projects/my-project-copy
+```
+
+### `gitdrive clone <name> [directory]`
+
+Alternative clone command that doesn't require `git-remote-gdrive` on your
+`PATH`. Downloads all bundles, applies them, sets up the `gdrive` remote,
+and checks out the browsable branch.
+
+```bash
 gitdrive clone my-project
-
-# Clone into a specific directory
 gitdrive clone my-project /tmp/my-project-copy
-
-# Use a custom remote name
 gitdrive clone my-project --name backup
 ```
 
