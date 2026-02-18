@@ -22,6 +22,7 @@ venv/
 Thumbs.db
 
 # GitDrive local state
+.gitdrive/
 .pyproject_hash
 
 # Credentials (should never be committed)
