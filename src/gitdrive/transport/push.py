@@ -6,6 +6,7 @@ import hashlib
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from gitdrive.config import GitDriveConfig
@@ -89,6 +90,8 @@ class PushHandler:
 
     def _push_one(self, refspec: Refspec, tmp: Path) -> None:
         """Push a single refspec: bundle, upload, update manifest."""
+        branch = refspec.src.removeprefix("refs/heads/")
+
         # 1. Resolve source ref to a SHA.
         src_sha = self._resolve_ref(refspec.src)
 
@@ -96,6 +99,7 @@ class PushHandler:
         exclude_shas = self._get_exclude_shas()
 
         # 3. Create the git bundle.
+        self._msg(f"  Creating bundle for {branch}...")
         bundle_id = self._manifest.next_bundle_id()
         bundle_path = tmp / f"{bundle_id}.bundle"
         self._create_bundle(bundle_path, refspec.src, exclude_shas)
@@ -105,11 +109,16 @@ class PushHandler:
 
         # 5. Upload the bundle to Drive.
         bundle_bytes = bundle_path.read_bytes()
+        size = len(bundle_bytes)
+        self._msg(f"  Uploading bundle ({self._fmt_size(size)})...")
+        t0 = time.monotonic()
         file_id = self._client.upload_file(
             name=f"{bundle_id}.bundle",
             content=bundle_bytes,
             parent_id=self._bundles_folder_id,
         )
+        elapsed = time.monotonic() - t0
+        self._msg(f"  Uploaded bundle — {self._fmt_speed(size, elapsed)}")
 
         # 6. Sync browsable files if this push updates the browsable ref.
         #    On first push (no refs yet), adopt the pushed branch as the
@@ -134,6 +143,7 @@ class PushHandler:
         self._manifest.updated_at = _utcnow_iso()
 
         # 8. Upload manifest to Drive.
+        self._msg("  Updating manifest...")
         self._upload_manifest()
 
         self._msg(f"  {refspec.dst} -> {src_sha[:8]}")
@@ -257,3 +267,24 @@ class PushHandler:
     def _msg(text: str) -> None:
         """Write a user-facing message to stderr."""
         print(text, file=sys.stderr)
+
+    @staticmethod
+    def _fmt_size(n: int) -> str:
+        """Format a byte count as a human-readable string."""
+        if n < 1024:
+            return f"{n} B"
+        if n < 1024 * 1024:
+            return f"{n / 1024:.1f} KB"
+        return f"{n / (1024 * 1024):.1f} MB"
+
+    @staticmethod
+    def _fmt_speed(nbytes: int, elapsed: float) -> str:
+        """Format transfer speed as a human-readable string."""
+        if elapsed <= 0:
+            return ""
+        bps = nbytes / elapsed
+        if bps < 1024:
+            return f"{bps:.0f} B/s"
+        if bps < 1024 * 1024:
+            return f"{bps / 1024:.1f} KB/s"
+        return f"{bps / (1024 * 1024):.1f} MB/s"
