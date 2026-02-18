@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gitdrive"
+version = "0.1.0"
+description = "Turn a Google Drive folder into a Git remote — push, pull, and browse your repos on Drive."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "razboy" }]
+keywords = ["git", "google-drive", "remote", "backup", "bundle"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Version Control :: Git",
+]
+
+dependencies = [
+    "click>=8.1",
+    "google-api-python-client>=2.100",
+    "google-auth-oauthlib>=1.1",
+    "google-auth-httplib2>=0.2",
+    "cryptography>=41.0",
+]
+
+[project.scripts]
+gitdrive = "gitdrive.cli.commands:cli"
+"git-remote-gdrive" = "gitdrive.remote.helper:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gitdrive"]
