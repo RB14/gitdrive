@@ -154,4 +154,8 @@ VERSION="$("$BIN_DIR/gitdrive" --version 2>&1)" || {
 success "$VERSION"
 echo ""
 success "GitDrive installed successfully!"
+warn "Installed in editable mode — do NOT move, rename, or delete this directory:"
+warn "  $GITDRIVE_SRC"
+warn "To update: cd $GITDRIVE_SRC && git pull && ./install.sh"
+echo ""
 info "Run 'gitdrive --help' to get started."

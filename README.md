@@ -85,6 +85,11 @@ This will:
    without reinstalling)
 3. Place `gitdrive` and `git-remote-gdrive` wrapper scripts in `~/.local/bin/`
 
+> **Warning:** The install uses editable mode — the cloned directory is linked,
+> not copied. **Do not move, rename, or delete the cloned repo** after
+> installing, or `gitdrive` will break. To update, `git pull` inside the
+> repo and re-run `./install.sh`.
+
 If `~/.local/bin` is not on your `PATH`, the installer will print instructions
 to add it. After installation, all commands are available directly:
 
