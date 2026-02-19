@@ -194,6 +194,8 @@ class TreeSyncer:
 
     def _ensure_all_folders(self, file_paths: list[str]) -> None:
         """Create all required folder paths on Drive (sequential)."""
+        # Collect unique folder paths first.
+        unique_folders: list[str] = []
         seen: set[str] = set()
         for fp in file_paths:
             parent = PurePosixPath(fp).parent
@@ -202,7 +204,12 @@ class TreeSyncer:
             folder_path = str(parent)
             if folder_path not in seen:
                 seen.add(folder_path)
-                self._ensure_folder_path(folder_path)
+                unique_folders.append(folder_path)
+
+        total = len(unique_folders)
+        for i, folder_path in enumerate(unique_folders, 1):
+            self._progress(f"  Preparing folders ({i}/{total})")
+            self._ensure_folder_path(folder_path)
 
     def _prefetch_file_listings(self, file_paths: list[str]) -> None:
         """Pre-list existing files per folder (1 API call per folder).
@@ -221,9 +228,9 @@ class TreeSyncer:
                 if fid:
                     folder_ids.add(fid)
 
-        for fid in folder_ids:
-            if fid in self._file_listing_cache:
-                continue
+        to_list = [fid for fid in folder_ids if fid not in self._file_listing_cache]
+        for i, fid in enumerate(to_list, 1):
+            self._progress(f"  Indexing existing files ({i}/{len(to_list)} folders)")
             try:
                 files = self._client.list_files(fid)
                 self._file_listing_cache[fid] = {
