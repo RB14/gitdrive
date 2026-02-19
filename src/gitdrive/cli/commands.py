@@ -507,6 +507,35 @@ def gc(ctx: click.Context, repo: str) -> None:
                 f"Failed to update manifest: {exc}"
             ) from exc
 
+    # Clean up orphaned bundles in bundles/ folder.
+    try:
+        all_bundle_files = client.list_files(bundles_folder_id)
+        valid_ids = {new_file_id}
+        orphans = [f for f in all_bundle_files if f["id"] not in valid_ids]
+        for orphan in orphans:
+            try:
+                client.delete_file(orphan["id"])
+            except DriveApiError:
+                click.echo(
+                    click.style(
+                        f"  Warning: could not delete orphan bundle {orphan['name']}",
+                        fg="yellow",
+                    )
+                )
+        if orphans:
+            click.echo(f"  Cleaned up {len(orphans)} orphaned bundle(s)")
+    except DriveApiError:
+        pass  # Best effort.
+
+    # Clean up sync-lock if present.
+    try:
+        lock_id = client.find_file("sync-lock", parent_id=gitdrive_id)
+        if lock_id:
+            client.delete_file(lock_id)
+            click.echo("  Removed stale sync-lock")
+    except DriveApiError:
+        pass  # Best effort.
+
     click.echo(
         f"Garbage collection complete: "
         f"{click.style(str(old_count), fg='yellow')} bundles → "
@@ -675,6 +704,15 @@ def sync(ctx: click.Context, repo_name: str | None) -> None:
 
     syncer = TreeSyncer(client, repo_folder_id)
     syncer.sync(old_sha=None, new_sha=sha)
+
+    # Clean up sync-lock if present (Drive is now consistent).
+    try:
+        lock_id = client.find_file("sync-lock", parent_id=gitdrive_id)
+        if lock_id:
+            client.delete_file(lock_id)
+            click.echo("  Removed stale sync-lock")
+    except DriveApiError:
+        pass  # Best effort.
 
     # Persist browsable_ref if it was resolved via fallback.
     if manifest.browsable_ref != browsable:

@@ -34,8 +34,8 @@ class TreeSyncer:
         self._repo_folder_id = repo_folder_id
         # Cache: repo-relative folder path → Drive folder ID
         self._folder_cache: dict[str, str] = {}
-        # Cache: (parent_id, file_name) → Drive file ID (or None)
-        self._file_listing_cache: dict[str, dict[str, str]] = {}
+        # Cache: folder_id → {name: (file_id, mimeType)}
+        self._file_listing_cache: dict[str, dict[str, tuple[str, str]]] = {}
         # Running stats for speed display (guarded by lock for threads).
         self._sync_bytes: int = 0
         self._sync_done: int = 0
@@ -59,7 +59,11 @@ class TreeSyncer:
     # ── Full sync ─────────────────────────────────────────────────
 
     def _full_sync(self, sha: str) -> None:
-        """Upload every tracked file for the given commit."""
+        """Upload every tracked file and delete stale files from Drive.
+
+        This is an **authoritative** sync: after it completes, the Drive
+        folder tree matches the git tree exactly (modulo ``.gitdrive``).
+        """
         result = subprocess.run(
             ["git", "ls-tree", "-r", "--name-only", sha],
             capture_output=True,
@@ -79,11 +83,24 @@ class TreeSyncer:
         # Phase 1: ensure all folder paths exist (sequential — creates dirs).
         self._ensure_all_folders(all_files)
 
-        # Phase 2: pre-list existing files per folder (eliminates per-file
-        # find_file calls — 1 list_files per folder instead of 1 per file).
-        self._prefetch_file_listings(all_files)
+        # Phase 2: discover ALL folders on Drive (replaces _prefetch_file_listings).
+        # This finds folders left by previous syncs / branch switches too.
+        self._walk_drive_folders()
 
-        # Phase 3: parallel uploads.
+        # Phase 3: build the expected-files set for authoritative cleanup.
+        expected_files: dict[str, set[str]] = {}
+        for fp in all_files:
+            parent = PurePosixPath(fp).parent
+            if parent == PurePosixPath("."):
+                folder_id = self._repo_folder_id
+            else:
+                folder_id = self._folder_cache.get(str(parent))
+            if folder_id:
+                expected_files.setdefault(folder_id, set()).add(
+                    PurePosixPath(fp).name
+                )
+
+        # Phase 4: parallel uploads.
         self._sync_bytes = 0
         self._sync_done = 0
         self._sync_total = total
@@ -104,6 +121,9 @@ class TreeSyncer:
                     )
 
         self._progress_done(total)
+
+        # Phase 5: authoritative cleanup — delete stale files.
+        self._cleanup_stale_files(expected_files)
 
     # ── Incremental sync ──────────────────────────────────────────
 
@@ -234,7 +254,8 @@ class TreeSyncer:
             try:
                 files = self._client.list_files(fid)
                 self._file_listing_cache[fid] = {
-                    f["name"]: f["id"] for f in files
+                    f["name"]: (f["id"], f.get("mimeType", ""))
+                    for f in files
                 }
             except DriveApiError:
                 self._file_listing_cache[fid] = {}
@@ -243,9 +264,139 @@ class TreeSyncer:
         """Look up an existing file ID from the pre-fetched listing cache."""
         listing = self._file_listing_cache.get(parent_id)
         if listing is not None:
-            return listing.get(name)
+            entry = listing.get(name)
+            return entry[0] if entry else None
         # Fallback to individual API call if not pre-fetched.
         return self._client.find_file(name, parent_id=parent_id)
+
+    # ── Drive discovery & cleanup ────────────────────────────────
+
+    def _walk_drive_folders(self) -> None:
+        """Recursively list all folders under the repo root into caches.
+
+        Discovers ALL Drive folders (not just those in the git tree) so
+        that ``_cleanup_stale_files`` can find and remove stale files left
+        by previous syncs or branch switches.  Populates both
+        ``_folder_cache`` and ``_file_listing_cache``.
+        """
+        queue: list[tuple[str, str]] = [(self._repo_folder_id, "")]
+        visited = 0
+
+        while queue:
+            folder_id, rel_path = queue.pop(0)
+            if folder_id in self._file_listing_cache:
+                continue
+
+            visited += 1
+            self._progress(f"  Indexing Drive folders ({visited})")
+
+            try:
+                files = self._client.list_files(folder_id)
+            except DriveApiError:
+                self._file_listing_cache[folder_id] = {}
+                continue
+
+            listing: dict[str, tuple[str, str]] = {}
+            for f in files:
+                name = f["name"]
+                fid = f["id"]
+                mime = f.get("mimeType", "")
+                listing[name] = (fid, mime)
+
+                # Recurse into subfolders, skipping excluded dirs.
+                if mime == DriveClient.FOLDER_MIME:
+                    if name not in self._EXCLUDE_DIRS:
+                        sub_path = (
+                            f"{rel_path}/{name}" if rel_path else name
+                        )
+                        self._folder_cache.setdefault(sub_path, fid)
+                        queue.append((fid, sub_path))
+
+            self._file_listing_cache[folder_id] = listing
+
+    def _cleanup_stale_files(
+        self, expected_files: dict[str, set[str]]
+    ) -> None:
+        """Delete files on Drive not in the expected set, then remove
+        any folders left empty as a result.
+
+        Skips the ``.gitdrive`` metadata folder and the repo root.
+        """
+        # ── Phase 1: identify and delete stale files ──────────────
+        stale: list[tuple[str, str]] = []  # (file_id, name)
+
+        for folder_id, listing in self._file_listing_cache.items():
+            expected = expected_files.get(folder_id, set())
+            for name, (file_id, mime_type) in listing.items():
+                # Never delete subfolders (handled in phase 2).
+                if mime_type == DriveClient.FOLDER_MIME:
+                    continue
+                # Belt-and-suspenders: never touch .gitdrive by name.
+                if name == ".gitdrive":
+                    continue
+                if name not in expected:
+                    stale.append((file_id, name))
+
+        deleted_ids: set[str] = set()
+
+        if stale:
+            self._msg(
+                f"  Cleaning up {len(stale)} stale"
+                f" file{'s' if len(stale) != 1 else ''}..."
+            )
+            for file_id, name in stale:
+                try:
+                    self._client.delete_file(file_id)
+                    deleted_ids.add(file_id)
+                except DriveApiError as exc:
+                    self._msg(
+                        f"Warning: failed to delete stale file"
+                        f" {name}: {exc}"
+                    )
+
+        # ── Phase 2: remove folders left empty ────────────────────
+        # Reverse map so we can sort by depth.
+        id_to_path: dict[str, str] = {
+            fid: path for path, fid in self._folder_cache.items()
+        }
+
+        # Only consider non-root folders that aren't expected to hold
+        # files (expected_files entries may point to folders whose
+        # listing cache is stale because uploads happened after the
+        # walk).
+        candidates = [
+            fid
+            for fid in self._file_listing_cache
+            if fid != self._repo_folder_id
+            and fid in id_to_path
+            and fid not in expected_files
+        ]
+        # Deepest first so children are resolved before parents.
+        candidates.sort(
+            key=lambda fid: id_to_path[fid].count("/"), reverse=True
+        )
+
+        removed_folders = 0
+        for folder_id in candidates:
+            listing = self._file_listing_cache.get(folder_id, {})
+            # Folder is empty when every item in its listing was
+            # deleted (stale file or empty subfolder from this pass).
+            if all(
+                fid in deleted_ids
+                for _name, (fid, _mime) in listing.items()
+            ):
+                try:
+                    self._client.delete_file(folder_id)
+                    deleted_ids.add(folder_id)
+                    removed_folders += 1
+                except DriveApiError:
+                    pass
+
+        if removed_folders:
+            self._msg(
+                f"  Removed {removed_folders} empty"
+                f" folder{'s' if removed_folders != 1 else ''}"
+            )
 
     # ── File operations ───────────────────────────────────────────
 

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from gitdrive.config import GitDriveConfig
@@ -35,6 +37,7 @@ class PushHandler:
         self._repo_folder_id: str | None = None
         self._gitdrive_folder_id: str | None = None
         self._bundles_folder_id: str | None = None
+        self._sync_lock_file_id: str | None = None
 
     # ── public API ───────────────────────────────────────────────────
 
@@ -126,8 +129,22 @@ class PushHandler:
         if not self._manifest.refs:
             self._manifest.browsable_ref = refspec.dst
 
-        if refspec.dst == self._manifest.browsable_ref:
+        needs_sync = refspec.dst == self._manifest.browsable_ref
+        sync_lock_written = False
+
+        if needs_sync:
             old_sha = self._manifest.refs.get(refspec.dst)
+
+            # 6a. Check for interrupted sync → force authoritative full sync.
+            if self._check_sync_lock():
+                self._msg("  Detected interrupted sync — forcing full sync")
+                old_sha = None
+
+            # 6b. Write sync-lock before starting browsable sync.
+            self._write_sync_lock()
+            sync_lock_written = True
+
+            # 6c. Sync browsable files.
             self._sync_browsable(old_sha, src_sha)
 
         # 7. Update manifest in memory.
@@ -145,6 +162,10 @@ class PushHandler:
         # 8. Upload manifest to Drive.
         self._msg("  Updating manifest...")
         self._upload_manifest()
+
+        # 9. Delete sync-lock (Drive is now consistent).
+        if sync_lock_written:
+            self._delete_sync_lock()
 
         self._msg(f"  {refspec.dst} -> {src_sha[:8]}")
 
@@ -210,6 +231,39 @@ class PushHandler:
             for chunk in iter(lambda: f.read(8192), b""):
                 h.update(chunk)
         return h.hexdigest()
+
+    # ── sync-lock ────────────────────────────────────────────────────
+
+    def _check_sync_lock(self) -> bool:
+        """Return ``True`` if a sync-lock file exists on Drive."""
+        lock_id = self._client.find_file(
+            "sync-lock", parent_id=self._gitdrive_folder_id
+        )
+        if lock_id:
+            self._sync_lock_file_id = lock_id
+            return True
+        return False
+
+    def _write_sync_lock(self) -> None:
+        """Write (or overwrite) a sync-lock file to Drive."""
+        content = json.dumps(
+            {"started_at": datetime.now(timezone.utc).isoformat()}
+        ).encode("utf-8")
+        self._sync_lock_file_id = self._client.upload_file(
+            name="sync-lock",
+            content=content,
+            parent_id=self._gitdrive_folder_id,
+            existing_file_id=self._sync_lock_file_id,
+        )
+
+    def _delete_sync_lock(self) -> None:
+        """Delete the sync-lock file from Drive."""
+        if self._sync_lock_file_id:
+            try:
+                self._client.delete_file(self._sync_lock_file_id)
+            except DriveApiError:
+                pass  # Lock removal failed — next push will do a full sync.
+            self._sync_lock_file_id = None
 
     # ── browsable sync ───────────────────────────────────────────────
 
