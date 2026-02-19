@@ -107,9 +107,15 @@ class RemoteHelper:
 
         Downloads the manifest from Drive and outputs each ref.  If the
         manifest does not yet exist (first push), outputs only a blank line.
+
+        A ``@<ref> HEAD`` symref line is emitted so that ``git clone``
+        knows which branch to check out and can set up tracking.
         """
         manifest = self._load_manifest()
         if manifest is not None:
+            head_ref = manifest.resolve_browsable_ref()
+            if head_ref and head_ref in manifest.refs:
+                self._respond(f"@{head_ref} HEAD")
             for refname, sha in manifest.refs.items():
                 self._respond(f"{sha} {refname}")
         self._respond("")

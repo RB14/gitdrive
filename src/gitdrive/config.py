@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -80,6 +81,10 @@ class GitDriveConfig:
     config_dir: Path = field(default_factory=_default_config_dir)
     data_dir: Path = field(default_factory=_default_data_dir)
 
+    # Lazily resolved path to the current repo's .git directory.
+    _git_dir_cache: Path | None = field(default=None, init=False, repr=False)
+    _git_dir_resolved: bool = field(default=False, init=False, repr=False)
+
     # ── directory-derived properties ────────────────────────────────
 
     @property
@@ -147,18 +152,57 @@ class GitDriveConfig:
     # ── convenience accessors ───────────────────────────────────────
 
     def get_applied_bundles(self, repo: str) -> list[str]:
-        """Return the list of bundle IDs already applied for *repo*."""
-        settings = self.load_settings()
-        return list(settings.get("applied_bundles", {}).get(repo, []))
+        """Return the list of bundle IDs already applied for *repo*.
+
+        Applied bundles are stored per-clone in
+        ``<git-dir>/gitdrive/applied_bundles.json`` so the tracking is
+        naturally scoped to the local repository.
+        """
+        path = self._applied_bundles_file()
+        if path is None or not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return list(data.get(repo, []))
+        except (json.JSONDecodeError, OSError):
+            return []
 
     def mark_bundle_applied(self, repo: str, bundle_id: str) -> None:
-        """Record *bundle_id* as applied for *repo* and persist."""
-        settings = self.load_settings()
-        applied: dict[str, list[str]] = settings.setdefault("applied_bundles", {})
-        repo_bundles = applied.setdefault(repo, [])
+        """Record *bundle_id* as applied for *repo* and persist.
+
+        Written atomically to ``<git-dir>/gitdrive/applied_bundles.json``.
+        """
+        path = self._applied_bundles_file()
+        if path is None:
+            return  # Not in a git repo — nothing to track.
+
+        # Load existing data.
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                data = {}
+        else:
+            data = {}
+
+        repo_bundles: list[str] = data.setdefault(repo, [])
         if bundle_id not in repo_bundles:
             repo_bundles.append(bundle_id)
-        self.save_settings(settings)
+
+        # Atomic write.
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        payload = json.dumps(data, indent=2) + "\n"
+        fd, tmp_path = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=".applied_bundles_",
+            suffix=".tmp",
+        )
+        try:
+            os.write(fd, payload.encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp_path, path)
 
     def get_repo_cache_dir(self, repo: str) -> Path:
         """Return the bundle-cache subdirectory for *repo*, creating it if needed."""
@@ -168,9 +212,28 @@ class GitDriveConfig:
 
     # ── private helpers ─────────────────────────────────────────────
 
+    def _get_git_dir(self) -> Path | None:
+        """Return the ``.git`` directory for the current repo (cached)."""
+        if not self._git_dir_resolved:
+            result = subprocess.run(
+                ["git", "rev-parse", "--git-dir"],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                self._git_dir_cache = Path(result.stdout.strip()).resolve()
+            self._git_dir_resolved = True
+        return self._git_dir_cache
+
+    def _applied_bundles_file(self) -> Path | None:
+        """Return the path to the per-repo applied bundles file."""
+        git_dir = self._get_git_dir()
+        if git_dir is None:
+            return None
+        return git_dir / "gitdrive" / "applied_bundles.json"
+
     @staticmethod
     def _default_settings() -> dict[str, Any]:
         return {
             "root_folder_id": None,
-            "applied_bundles": {},
         }
