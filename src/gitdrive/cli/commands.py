@@ -78,6 +78,24 @@ def _save_manifest(store: ManifestStore, manifest: Manifest, rerun: str) -> None
         raise click.ClickException(f"Failed to update manifest: {exc}") from exc
 
 
+def _holds_unreferenced_objects(repo: Path, bundle: Path, refs: dict[str, str]) -> bool:
+    """Return ``True`` if *bundle*, unbundled into *repo*, carries objects
+    that none of *refs* reach (e.g. history a force push rewrote away)."""
+    result = subprocess.run(
+        ["git", "-C", str(repo), "bundle", "list-heads", str(bundle)],
+        capture_output=True,
+        text=True,
+    )
+    heads = [line.split()[0] for line in result.stdout.splitlines() if line.strip()]
+    result = subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--objects", *heads, "--not", *refs.values()],
+        capture_output=True,
+        text=True,
+    )
+    # When in doubt, report True: compacting is always safe.
+    return result.returncode != 0 or bool(result.stdout.strip())
+
+
 def _short_sha(sha: str) -> str:
     """Return the first 8 characters of a SHA hex string."""
     return sha[:8] if len(sha) >= 8 else sha
@@ -401,7 +419,12 @@ def info(ctx: click.Context, repo: str) -> None:
 @click.argument("repo")
 @click.pass_context
 def gc(ctx: click.Context, repo: str) -> None:
-    """Garbage-collect bundles for a repository."""
+    """Garbage-collect bundles for a repository.
+
+    Compacts every bundle into one holding only the objects the refs on
+    Drive reach, which also purges history rewritten away by force pushes
+    and the objects of deleted refs.
+    """
     config: GitDriveConfig = ctx.obj["config"]
     _auth, client = _get_auth_and_client(ctx)
     root_id = _require_root_folder(config)
@@ -420,8 +443,8 @@ def gc(ctx: click.Context, repo: str) -> None:
     manifest = _load_manifest(store, repo)
 
     old_count = len(manifest.bundles)
-    if old_count <= 1:
-        click.echo("Nothing to garbage-collect (0 or 1 bundles).")
+    if old_count == 0:
+        click.echo("Nothing to garbage-collect (no bundles).")
         return
 
     with tempfile.TemporaryDirectory(prefix="gitdrive-gc-") as tmp_dir:
@@ -472,7 +495,17 @@ def gc(ctx: click.Context, repo: str) -> None:
                     f"{result.stderr.strip()}"
                 )
 
-        # Create a single compacted bundle from the bare repo.
+        # A lone bundle is already compact unless it holds objects no ref
+        # reaches any more (history rewritten away, deleted refs).
+        if old_count == 1 and not _holds_unreferenced_objects(
+            bare_repo, tmp / f"{manifest.bundles[0].id}.bundle", manifest.refs
+        ):
+            click.echo("Nothing to garbage-collect (already compact).")
+            return
+
+        # Create a single compacted bundle from the bare repo.  It holds only
+        # the objects the manifest's refs reach — the bare repo has no other
+        # refs — so rewritten-away history is left behind.
         compacted_path = tmp / "compacted.bundle"
         result = subprocess.run(
             [
@@ -584,7 +617,8 @@ def gc(ctx: click.Context, repo: str) -> None:
 
     click.echo(
         f"Garbage collection complete: "
-        f"{click.style(str(old_count), fg='yellow')} bundles → "
+        f"{click.style(str(old_count), fg='yellow')} "
+        f"bundle{'s' if old_count != 1 else ''} → "
         f"{click.style('1', fg='green')}"
     )
 

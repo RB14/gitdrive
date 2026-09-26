@@ -2,9 +2,27 @@
 
 from __future__ import annotations
 
-from support import REPO_NAME, commit, git, gitdrive
+import subprocess
+from pathlib import Path
+
+from support import REPO_NAME, Remote, commit, git, gitdrive
 
 MAIN = "refs/heads/main:refs/heads/main"
+
+
+def _commit_secret() -> str:
+    """Commit a file holding a secret; return the secret's blob ID."""
+    Path("secret.txt").write_text("hunter2\n")
+    git("add", "secret.txt")
+    git("commit", "-q", "-m", "Add secret")
+    return git("rev-parse", "HEAD:secret.txt")
+
+
+def _fresh_clone_has(remote: Remote, clone: Path, blob: str) -> bool:
+    """Clone into *clone* and report whether it holds object *blob* at all."""
+    remote.clone(clone)
+    result = subprocess.run(["git", "-C", str(clone), "cat-file", "-e", blob])
+    return result.returncode == 0
 
 
 def _push_three_bundles(remote) -> str:
@@ -86,3 +104,42 @@ def test_browse_does_not_overwrite_a_manifest_changed_meanwhile(repo, remote):
     manifest = remote.manifest()
     assert manifest.browsable_ref == "refs/heads/main"
     assert manifest.refs["refs/heads/other"] == main
+
+
+def test_gc_purges_history_a_force_push_rewrote_away(repo, remote, tmp_path):
+    remote.push(MAIN)
+    secret = _commit_secret()
+    remote.push(MAIN)
+    git("reset", "-q", "--hard", "HEAD~1")  # rewrite history without the secret
+    commit("clean.txt")
+    remote.push("+" + MAIN)
+    assert _fresh_clone_has(remote, tmp_path / "before", secret)  # still on Drive
+
+    assert gitdrive("gc", REPO_NAME).exit_code == 0
+
+    assert not _fresh_clone_has(remote, tmp_path / "after", secret)
+
+
+def test_gc_purges_a_rewind_onto_an_already_pushed_commit(repo, remote, tmp_path):
+    secret = _commit_secret()
+    remote.push(MAIN)  # one bundle, holding the secret
+    git("reset", "-q", "--hard", "HEAD~1")
+    remote.push("+" + MAIN)  # ref-only: the parent commit is already on Drive
+    assert remote.bundle_ids() == ["0001"]
+
+    result = gitdrive("gc", REPO_NAME)
+
+    assert result.exit_code == 0, result.output
+    assert not _fresh_clone_has(remote, tmp_path / "clone", secret)
+
+
+def test_gc_leaves_an_already_compact_repository_alone(repo, remote):
+    _push_three_bundles(remote)
+    assert gitdrive("gc", REPO_NAME).exit_code == 0
+    compacted = remote.bundle_ids()
+
+    result = gitdrive("gc", REPO_NAME)
+
+    assert result.exit_code == 0
+    assert "Nothing to garbage-collect" in result.output
+    assert remote.bundle_ids() == compacted  # no new bundle for clones to fetch

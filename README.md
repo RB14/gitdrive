@@ -321,17 +321,33 @@ gitdrive info my-project
 ### `gitdrive gc <name>`
 
 Garbage-collect a remote — compact incremental bundles into a single full
-bundle to reclaim Drive storage.
+bundle to reclaim Drive storage. The compacted bundle holds only the objects
+reachable from the branches and tags on Drive, so `gc` is also how you purge
+history from Drive after rewriting it:
 
 ```bash
 gitdrive gc my-project
+
+# e.g. drop a commit that should never have been pushed, then purge it
+git reset --hard HEAD~1
+git push --force-with-lease gdrive main
+gitdrive gc my-project
 ```
+
+Until you run `gc`, a force push only moves the ref: the old commits stay on
+Drive inside their bundles, and so do the objects of deleted refs. Note what
+`gc` cannot reach: it moves the old bundles to Drive's trash (restorable until
+you empty the trash, or for 30 days), Drive keeps earlier versions of the
+browsable files that pushes updated, and existing clones keep whatever they
+fetched. To get rid of a leaked secret, also empty the trash and delete the
+files' old versions in the Drive UI — and rotate the secret anyway.
 
 The compacted bundle takes the next bundle ID instead of restarting at `0001`,
 so existing clones — which record the bundle IDs they have applied — download
-it rather than mistake it for one they already have. The old bundles are deleted only
-once the manifest points at the compacted one. If a push lands while `gc`
-runs, `gc` changes nothing and asks you to run it again.
+it rather than mistake it for one they already have. The old bundles are
+removed only once the manifest points at the compacted one. If a push lands
+while `gc` runs, `gc` changes nothing and asks you to run it again. Running
+`gc` on a repository that is already compact changes nothing.
 
 ### `gitdrive browse [branch] [--repo NAME]`
 
