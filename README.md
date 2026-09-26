@@ -326,6 +326,10 @@ bundle to reclaim Drive storage.
 gitdrive gc my-project
 ```
 
+The old bundles are deleted only once the manifest points at the compacted
+one. If a push lands while `gc` runs, `gc` changes nothing and asks you to run
+it again.
+
 ### `gitdrive browse [branch] [--repo NAME]`
 
 View or change the browsable branch for a repository. Without a branch
@@ -414,6 +418,16 @@ manifest is updated. (An annotated tag always brings its new tag object, so it
 gets a tiny bundle of its own.) A fetch applies every bundle it has not applied
 yet, whichever refs they were created for, so such refs resolve like any other.
 For the same reason, deleting a ref leaves its bundles in the chain.
+
+### Concurrent Updates
+
+Every command that rewrites the manifest — a push, `gitdrive gc`, `browse`,
+`sync` — remembers which revision of `manifest.json` it read and refuses to
+save if Drive's copy has changed since, instead of overwriting the other
+writer's refs and bundles. A push that loses such a race fails its refs with
+`the manifest on Drive changed since it was read; fetch and push again`, and
+removes the bundle it had uploaded. (Drive has no atomic compare-and-swap, so
+two writes landing in the very same instant can still collide.)
 
 ### Browsable File Sync
 
@@ -511,6 +525,20 @@ gitdrive browse master
 - Run `gitdrive gc <name>` to compact incremental bundles into a single bundle
 - Check your network connection to Google's servers
 - Large binary files will slow down both git and Drive operations
+
+### "the manifest on Drive changed since it was read"
+
+Another push (or a `gitdrive gc`, `browse`, or `sync`) updated the repository
+on Drive while yours was running. GitDrive refused to overwrite it, so nothing
+was lost. Fetch, integrate the changes if needed, and push again:
+
+```bash
+git fetch gdrive
+git push gdrive main
+```
+
+`gitdrive gc`, `browse`, and `sync` fail the same way and can simply be run
+again.
 
 ### "Rate limit exceeded"
 

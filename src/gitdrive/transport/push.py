@@ -16,11 +16,12 @@ from gitdrive.drive.client import DriveClient
 from gitdrive.exceptions import (
     BundleError,
     DriveApiError,
-    ManifestError,
+    ManifestConflictError,
     PushRejectedError,
 )
 from gitdrive.remote.helper import Refspec
 from gitdrive.store.manifest import BundleEntry, Manifest, _utcnow_iso
+from gitdrive.store.manifest_store import ManifestStore
 
 
 class PushHandler:
@@ -32,11 +33,15 @@ class PushHandler:
         client: DriveClient,
         manifest: Manifest,
         repo_name: str,
+        manifest_store: ManifestStore | None = None,
     ) -> None:
         self._config = config
         self._client = client
         self._manifest = manifest
         self._repo_name = repo_name
+        # Where *manifest* was loaded from; ``None`` if no manifest existed
+        # yet (_ensure_repo_structure() then creates an empty-based store).
+        self._store = manifest_store
 
         # Populated by _ensure_repo_structure().
         self._repo_folder_id: str | None = None
@@ -71,6 +76,8 @@ class PushHandler:
                     else:
                         self._delete_one(refspec)
                     results.append((refspec, None))
+                except ManifestConflictError as exc:
+                    results.append((refspec, f"{exc}; fetch and push again"))
                 except (
                     BundleError,
                     DriveApiError,
@@ -99,6 +106,8 @@ class PushHandler:
         self._bundles_folder_id = self._client.ensure_folder(
             "bundles", parent_id=self._gitdrive_folder_id
         )
+        if self._store is None:
+            self._store = ManifestStore(self._client, self._gitdrive_folder_id)
 
     # ── single-refspec push ──────────────────────────────────────────
 
@@ -111,6 +120,9 @@ class PushHandler:
         the ref is recorded in the manifest.
         """
         branch = refspec.src.removeprefix("refs/heads/")
+
+        # 0. Fail fast if another push changed the manifest since we read it.
+        self._store.check()
 
         # 1. Resolve source ref to a SHA.
         src_sha = self._resolve_ref(refspec.src)
@@ -155,9 +167,16 @@ class PushHandler:
         self._manifest.update_refs({refspec.dst: src_sha})
         self._manifest.updated_at = _utcnow_iso()
 
-        # 6. Upload manifest to Drive.
+        # 6. Upload manifest to Drive — unless another push changed it
+        #    meanwhile.  Then our bundle is referenced nowhere, so drop it;
+        #    a sync-lock stays behind so the next push resyncs the files.
         self._msg("  Updating manifest...")
-        self._upload_manifest()
+        try:
+            self._store.save(self._manifest)
+        except ManifestConflictError:
+            if entry is not None:
+                self._discard_bundle(entry)
+            raise
 
         # 7. Delete sync-lock (Drive is now consistent).
         if sync_lock_written:
@@ -211,6 +230,8 @@ class PushHandler:
         them.  The ref the remote HEAD points to — the browsable branch —
         cannot be deleted, as its files are what Drive shows.
         """
+        self._store.check()
+
         if refspec.dst not in self._manifest.refs:
             raise PushRejectedError("remote ref does not exist")
 
@@ -224,7 +245,7 @@ class PushHandler:
         self._manifest.updated_at = _utcnow_iso()
 
         self._msg("  Updating manifest...")
-        self._upload_manifest()
+        self._store.save(self._manifest)
 
         self._msg(f"  {refspec.dst} deleted")
 
@@ -365,42 +386,14 @@ class PushHandler:
         syncer = TreeSyncer(self._client, self._repo_folder_id)
         syncer.sync(old_sha, new_sha)
 
-    # ── manifest upload ──────────────────────────────────────────────
+    # ── bundle cleanup ───────────────────────────────────────────────
 
-    def _upload_manifest(self) -> None:
-        """Upload the manifest to Drive, updating in place if it exists."""
-        manifest_json = self._manifest.to_json().encode("utf-8")
-
-        existing_id = self._client.find_file(
-            "manifest.json", parent_id=self._gitdrive_folder_id
-        )
-
-        if existing_id:
-            # Optimistic-locking sanity check: re-download and compare
-            # updated_at to detect concurrent pushes.
-            try:
-                current_raw = self._client.download_file(existing_id)
-                current = Manifest.from_json(current_raw.decode("utf-8"))
-                if current.updated_at != self._manifest.updated_at:
-                    self._msg(
-                        "  warning: manifest was modified by another push; "
-                        "overwriting"
-                    )
-            except (DriveApiError, ManifestError):
-                pass  # Manifest may be corrupted or absent — proceed anyway.
-
-            self._client.upload_file(
-                name="manifest.json",
-                content=manifest_json,
-                parent_id=self._gitdrive_folder_id,
-                existing_file_id=existing_id,
-            )
-        else:
-            self._client.upload_file(
-                name="manifest.json",
-                content=manifest_json,
-                parent_id=self._gitdrive_folder_id,
-            )
+    def _discard_bundle(self, entry: BundleEntry) -> None:
+        """Trash an uploaded bundle that no manifest will reference."""
+        try:
+            self._client.delete_file(entry.file_id)
+        except DriveApiError:
+            pass  # An unreferenced bundle is harmless; gc removes it.
 
     # ── output ───────────────────────────────────────────────────────
 

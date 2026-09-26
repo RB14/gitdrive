@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import itertools
+
+from gitdrive.store.manifest import Manifest
+from gitdrive.transport import push as push_module
 from support import REPO_NAME, Remote, commit, git
 
 MAIN = "refs/heads/main:refs/heads/main"
 WIFI_LIVE = "refs/heads/wifi-live:refs/heads/wifi-live"
+CONFLICT = "error the manifest on Drive changed since it was read; fetch and push again"
 
 
 def _push_wifi_live_then_fast_forward_main(remote: Remote) -> str:
@@ -160,3 +165,72 @@ def test_recreating_a_deleted_ref_uploads_its_objects_again(repo, remote):
 
     # Deleted refs no longer vouch for their objects, so they are re-bundled.
     assert remote.bundle_ids() == ["0001", "0002", "0003"]
+
+
+def test_refs_of_one_push_do_not_trip_over_each_others_manifest(
+    repo, remote, monkeypatch, capsys
+):
+    # Every manifest update gets a distinct timestamp, as on a real, slow Drive.
+    ticks = itertools.count()
+    monkeypatch.setattr(
+        push_module, "_utcnow_iso", lambda: f"2026-01-01T00:00:{next(ticks):02d}Z"
+    )
+    remote.push(MAIN)
+    commit("a.txt")
+    git("branch", "copy")
+    git("tag", "v1")
+
+    replies = remote.push(
+        MAIN, "refs/heads/copy:refs/heads/copy", "refs/tags/v1:refs/tags/v1"
+    )
+
+    assert set(replies.values()) == {"ok"}
+    assert "warning" not in capsys.readouterr().err
+
+
+def test_push_does_not_overwrite_a_manifest_another_push_changed(repo, remote):
+    remote.push(MAIN)
+    git("branch", "feature")
+    remote.push("refs/heads/feature:refs/heads/feature")
+    old = git("rev-parse", "main")
+    tip = commit("a.txt")
+    # Another push lands while this one uploads its bundle.
+    remote.drive.before_upload(
+        "*.bundle",
+        lambda: remote.update_manifest(lambda m: m.update_refs({"refs/heads/other": old})),
+    )
+
+    replies = remote.push(MAIN, ":refs/heads/feature")
+
+    assert replies == {"refs/heads/main": CONFLICT, "refs/heads/feature": CONFLICT}
+    assert remote.manifest().refs == {
+        "refs/heads/main": old,
+        "refs/heads/feature": old,
+        "refs/heads/other": old,
+    }
+    # The bundle nothing references was dropped again.
+    assert remote.drive.listing(REPO_NAME, ".gitdrive", "bundles") == ["0001.bundle"]
+
+    # A fresh attempt (after fetching) goes through and keeps the other push.
+    assert remote.push(MAIN) == {"refs/heads/main": "ok"}
+    assert remote.manifest().refs["refs/heads/main"] == tip
+    assert remote.manifest().refs["refs/heads/other"] == old
+
+
+def test_first_push_does_not_overwrite_a_manifest_created_meanwhile(repo, remote):
+    sha = git("rev-parse", "main")
+
+    def other_first_push() -> None:
+        manifest = Manifest.new(REPO_NAME)
+        manifest.update_refs({"refs/heads/other": sha})
+        remote.drive.upload_file(
+            "manifest.json",
+            manifest.to_json().encode("utf-8"),
+            remote.drive.path_id(REPO_NAME, ".gitdrive"),
+        )
+
+    remote.drive.before_upload("*.bundle", other_first_push)
+
+    assert remote.push(MAIN) == {"refs/heads/main": CONFLICT}
+    assert remote.manifest().refs == {"refs/heads/other": sha}
+    assert remote.drive.listing(REPO_NAME, ".gitdrive", "bundles") == []

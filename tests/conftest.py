@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from gitdrive.cli import commands as cli_module
 from gitdrive.config import GitDriveConfig
 from gitdrive.remote import helper as helper_module
 from support import FakeDriveClient, Remote, commit, git
@@ -40,11 +41,12 @@ def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def drive(isolated_env: None, monkeypatch: pytest.MonkeyPatch) -> FakeDriveClient:
-    """A fake Drive, handed to every remote helper instead of the real one."""
+    """A fake Drive, handed to the remote helper and CLI instead of the real one."""
     fake = FakeDriveClient()
     GitDriveConfig().save_settings({"root_folder_id": fake.root_id})
-    monkeypatch.setattr(helper_module, "AuthManager", _NoAuth)
-    monkeypatch.setattr(helper_module, "DriveClient", lambda _creds: fake)
+    for module in (helper_module, cli_module):
+        monkeypatch.setattr(module, "AuthManager", _NoAuth)
+        monkeypatch.setattr(module, "DriveClient", lambda _creds: fake)
     return fake
 
 

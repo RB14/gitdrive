@@ -41,5 +41,9 @@ class ManifestError(GitDriveError):
     """Raised when manifest parsing or validation fails."""
 
 
+class ManifestConflictError(GitDriveError):
+    """Raised when the manifest on Drive changed since it was last read."""
+
+
 class ConfigError(GitDriveError):
     """Raised when configuration is invalid or missing."""

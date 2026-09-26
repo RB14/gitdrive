@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import io
 import itertools
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+from click.testing import CliRunner, Result
+
+from gitdrive.cli.commands import cli
 from gitdrive.drive.client import DriveClient
 from gitdrive.remote.helper import RemoteHelper
 from gitdrive.store.manifest import Manifest
@@ -44,7 +49,7 @@ class FakeDriveClient:
     """In-memory stand-in for :class:`DriveClient` — never touches the network.
 
     Mirrors the subset of the Drive API that gitdrive uses, including
-    trashing (not erasing) deleted files.
+    trashing (not erasing) deleted files and a revision per content upload.
     """
 
     def __init__(self) -> None:
@@ -52,6 +57,7 @@ class FakeDriveClient:
         self._ids = itertools.count(1)
         self._lock = threading.Lock()  # TreeSyncer uploads from worker threads.
         self.downloads: list[str] = []
+        self._before_upload: tuple[str, Callable[[], None]] | None = None
         self.root_id = self.create_folder("GitDrive")
 
     # ── DriveClient API ──────────────────────────────────────────────
@@ -73,11 +79,34 @@ class FakeDriveClient:
         mime_type: str = DriveClient.BUNDLE_MIME,
         existing_file_id: str | None = None,
     ) -> str:
-        if existing_file_id is not None:
-            with self._lock:
-                self._files[existing_file_id]["content"] = content
-            return existing_file_id
-        return self._create(name, parent_id, mime_type, content)
+        file_id, _ = self.upload_file_with_revision(
+            name, content, parent_id, mime_type, existing_file_id
+        )
+        return file_id
+
+    def upload_file_with_revision(
+        self,
+        name: str,
+        content: bytes,
+        parent_id: str,
+        mime_type: str = DriveClient.BUNDLE_MIME,
+        existing_file_id: str | None = None,
+    ) -> tuple[str, str]:
+        if self._before_upload and fnmatch.fnmatch(name, self._before_upload[0]):
+            action = self._before_upload[1]
+            self._before_upload = None
+            action()
+        if existing_file_id is None:
+            existing_file_id = self._create(name, parent_id, mime_type, b"")
+        with self._lock:
+            f = self._files[existing_file_id]
+            f["content"] = content
+            f["revision"] += 1
+            return existing_file_id, f"rev:{f['revision']}"
+
+    def get_revision(self, file_id: str) -> str:
+        with self._lock:
+            return f"rev:{self._files[file_id]['revision']}"
 
     def download_file(self, file_id: str) -> bytes:
         with self._lock:
@@ -104,6 +133,11 @@ class FakeDriveClient:
             ]
 
     # ── test helpers ─────────────────────────────────────────────────
+
+    def before_upload(self, pattern: str, action: Callable[[], None]) -> None:
+        """Run *action* once, just before the next upload of a file matching
+        the glob *pattern* — e.g. to land a concurrent write mid-push."""
+        self._before_upload = (pattern, action)
 
     def path_id(self, *names: str) -> str | None:
         """Resolve *names* as a path below the root folder (``None`` if absent)."""
@@ -139,6 +173,7 @@ class FakeDriveClient:
                 "mimeType": mime_type,
                 "content": content,
                 "trashed": False,
+                "revision": 0,
             }
         return file_id
 
@@ -224,6 +259,17 @@ class Remote:
         raw = self.drive.read(REPO_NAME, ".gitdrive", "manifest.json")
         return Manifest.from_json(raw.decode("utf-8"))
 
+    def update_manifest(self, change: Callable[[Manifest], None]) -> None:
+        """Apply *change* to the manifest on Drive, as another writer would."""
+        manifest = self.manifest()
+        change(manifest)
+        self.drive.upload_file(
+            name="manifest.json",
+            content=manifest.to_json().encode("utf-8"),
+            parent_id=self.drive.path_id(REPO_NAME, ".gitdrive"),
+            existing_file_id=self.drive.path_id(REPO_NAME, ".gitdrive", "manifest.json"),
+        )
+
     def bundle_ids(self) -> list[str]:
         """Return the IDs of the bundles listed in the manifest on Drive."""
         return [b.id for b in self.manifest().bundles]
@@ -236,3 +282,8 @@ class Remote:
         with patch.object(sys, "stdin", stdin), patch.object(sys, "stdout", stdout):
             RemoteHelper("gdrive", f"gdrive://{REPO_NAME}").run()
         return stdout.getvalue().splitlines()
+
+
+def gitdrive(*args: str) -> Result:
+    """Run the ``gitdrive`` CLI with *args* (in-process, against the fake Drive)."""
+    return CliRunner().invoke(cli, list(args))

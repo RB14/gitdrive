@@ -135,6 +135,58 @@ class DriveClient:
         Files larger than :pyattr:`RESUMABLE_THRESHOLD` use a resumable
         upload; smaller files use a simple media upload.
         """
+        result = self._upload(
+            name, content, parent_id, mime_type, existing_file_id, fields="id"
+        )
+        return result["id"]
+
+    def upload_file_with_revision(
+        self,
+        name: str,
+        content: bytes,
+        parent_id: str,
+        mime_type: str = BUNDLE_MIME,
+        existing_file_id: str | None = None,
+    ) -> tuple[str, str]:
+        """Upload like :meth:`upload_file`; return ``(file_id, revision)``.
+
+        The revision is read from the upload response itself, so it is the
+        one this upload created (see :meth:`get_revision`).
+        """
+        result = self._upload(
+            name,
+            content,
+            parent_id,
+            mime_type,
+            existing_file_id,
+            fields=f"id,{_REVISION_FIELDS}",
+        )
+        return result["id"], _revision_token(result)
+
+    def get_revision(self, file_id: str) -> str:
+        """Return a token that changes whenever the file's content changes.
+
+        This is the head revision ID, which Drive keeps for binary files and
+        bumps on every content upload.  Otherwise it falls back to the file
+        ``version``, which also moves on metadata edits and so can only
+        over-report a change, never miss one.
+        """
+        result = self._execute_with_retry(
+            self.service.files().get(fileId=file_id, fields=_REVISION_FIELDS)
+        )
+        return _revision_token(result)
+
+    def _upload(
+        self,
+        name: str,
+        content: bytes,
+        parent_id: str,
+        mime_type: str,
+        existing_file_id: str | None,
+        *,
+        fields: str,
+    ) -> dict[str, Any]:
+        """Create or update a file and return the requested *fields*."""
         resumable = len(content) > self.RESUMABLE_THRESHOLD
         media = MediaInMemoryUpload(
             content,
@@ -148,7 +200,7 @@ class DriveClient:
                 self.service.files().update(
                     fileId=existing_file_id,
                     media_body=media,
-                    fields="id",
+                    fields=fields,
                 )
             )
         else:
@@ -160,11 +212,11 @@ class DriveClient:
                 self.service.files().create(
                     body=metadata,
                     media_body=media,
-                    fields="id",
+                    fields=fields,
                 )
             )
 
-        return result["id"]
+        return result
 
     def download_file(self, file_id: str) -> bytes:
         """Download file content as bytes."""
@@ -359,6 +411,16 @@ class DriveClient:
 
 
 # ── Module-private helpers ───────────────────────────────────────
+
+# File fields that identify a file's content revision (see get_revision).
+_REVISION_FIELDS = "headRevisionId,version"
+
+
+def _revision_token(file_metadata: dict[str, Any]) -> str:
+    """Build a revision token from file metadata holding ``_REVISION_FIELDS``."""
+    head = file_metadata.get("headRevisionId")
+    return f"rev:{head}" if head else f"version:{file_metadata.get('version')}"
+
 
 def _escape_query(value: str) -> str:
     """Escape single quotes for Drive API query strings."""

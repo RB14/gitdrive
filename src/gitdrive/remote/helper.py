@@ -21,6 +21,7 @@ from gitdrive.drive.auth import AuthManager
 from gitdrive.drive.client import DriveClient
 from gitdrive.exceptions import GitDriveError
 from gitdrive.store.manifest import Manifest
+from gitdrive.store.manifest_store import ManifestStore
 
 
 @dataclass
@@ -53,7 +54,7 @@ class RemoteHelper:
         # Lazy-initialized resources.
         self._client: DriveClient | None = None
         self._manifest: Manifest | None = None
-        self._manifest_file_id: str | None = None
+        self._manifest_store: ManifestStore | None = None
         self._manifest_loaded: bool = False
 
         self._options: dict[str, str] = {}
@@ -170,6 +171,7 @@ class RemoteHelper:
             client=self._get_client(),
             manifest=self._get_manifest(),
             repo_name=self._repo_name,
+            manifest_store=self._manifest_store,
         )
         results: list[tuple[Refspec, str | None]] = handler.push(refspecs)
 
@@ -241,7 +243,8 @@ class RemoteHelper:
 
         Returns ``None`` if any part of the hierarchy is missing (repository
         has never been pushed to).  Both the parsed :class:`Manifest` and
-        the ``manifest.json`` file ID are cached for later use.
+        the :class:`ManifestStore` it came from are cached; a push saves
+        through that store, so it cannot overwrite a newer manifest.
         """
         if self._manifest_loaded:
             return self._manifest
@@ -263,16 +266,10 @@ class RemoteHelper:
         if gitdrive_folder_id is None:
             return None
 
-        manifest_file_id = client.find_file("manifest.json", parent_id=gitdrive_folder_id)
-        if manifest_file_id is None:
-            return None
-
-        raw = client.download_file(manifest_file_id)
-        manifest = Manifest.from_json(raw.decode("utf-8"))
-
-        self._manifest = manifest
-        self._manifest_file_id = manifest_file_id
-        return manifest
+        store = ManifestStore(client, gitdrive_folder_id)
+        self._manifest = store.load()
+        self._manifest_store = store
+        return self._manifest
 
     def _get_manifest(self) -> Manifest:
         """Return the cached manifest, or a fresh empty one if none exists."""

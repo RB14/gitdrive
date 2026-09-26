@@ -13,8 +13,14 @@ from gitdrive import __version__
 from gitdrive.config import GitDriveConfig
 from gitdrive.drive.auth import AuthManager
 from gitdrive.drive.client import DriveClient
-from gitdrive.exceptions import AuthenticationError, DriveApiError, ManifestError
+from gitdrive.exceptions import (
+    AuthenticationError,
+    DriveApiError,
+    ManifestConflictError,
+    ManifestError,
+)
 from gitdrive.store.manifest import BundleEntry, Manifest
+from gitdrive.store.manifest_store import ManifestStore
 
 # ── Helpers ───────────────────────────────────────────────────
 
@@ -41,6 +47,34 @@ def _require_root_folder(config: GitDriveConfig) -> str:
             "GitDrive is not initialized. Run 'gitdrive init' first."
         )
     return root_id
+
+
+def _load_manifest(store: ManifestStore, repo: str) -> Manifest:
+    """Load *repo*'s manifest through *store*, or abort."""
+    try:
+        manifest = store.load()
+    except (DriveApiError, ManifestError) as exc:
+        raise click.ClickException(f"Failed to read manifest: {exc}") from exc
+    if manifest is None:
+        raise click.ClickException(f"Repository '{repo}' has no manifest.json.")
+    return manifest
+
+
+def _save_manifest(store: ManifestStore, manifest: Manifest, rerun: str) -> None:
+    """Save *manifest* through *store*, or abort telling the user to *rerun*.
+
+    The save is refused when a push changed the manifest since it was
+    loaded, rather than silently dropping that push's refs and bundles.
+    """
+    try:
+        store.save(manifest)
+    except ManifestConflictError as exc:
+        raise click.ClickException(
+            "The manifest on Drive changed meanwhile (a push landed?), so it "
+            f"was not updated. Run '{rerun}' again."
+        ) from exc
+    except DriveApiError as exc:
+        raise click.ClickException(f"Failed to update manifest: {exc}") from exc
 
 
 def _short_sha(sha: str) -> str:
@@ -381,15 +415,8 @@ def gc(ctx: click.Context, repo: str) -> None:
             f"Repository '{repo}' exists but has no .gitdrive metadata."
         )
 
-    manifest_file_id = client.find_file("manifest.json", parent_id=gitdrive_id)
-    if manifest_file_id is None:
-        raise click.ClickException(f"Repository '{repo}' has no manifest.json.")
-
-    try:
-        raw = client.download_file(manifest_file_id)
-        manifest = Manifest.from_json(raw.decode("utf-8"))
-    except (DriveApiError, ManifestError) as exc:
-        raise click.ClickException(f"Failed to read manifest: {exc}") from exc
+    store = ManifestStore(client, gitdrive_id)
+    manifest = _load_manifest(store, repo)
 
     old_count = len(manifest.bundles)
     if old_count <= 1:
@@ -474,58 +501,68 @@ def gc(ctx: click.Context, repo: str) -> None:
                 f"Failed to upload compacted bundle: {exc}"
             ) from exc
 
-        # Delete old bundles from Drive.
-        for entry in manifest.bundles:
-            try:
-                client.delete_file(entry.file_id)
-            except DriveApiError:
-                click.echo(
-                    click.style(
-                        f"  Warning: could not delete old bundle {entry.id}",
-                        fg="yellow",
-                    )
-                )
-
-        # Update manifest: single bundle, same refs.
-        manifest.bundles = [
-            BundleEntry(
-                id=new_bundle_id,
-                file_id=new_file_id,
-            )
-        ]
-        manifest.updated_at = Manifest.new(repo).updated_at
-
-        try:
-            client.upload_file(
-                name="manifest.json",
-                content=manifest.to_json().encode("utf-8"),
-                parent_id=gitdrive_id,
-                existing_file_id=manifest_file_id,
-            )
-        except DriveApiError as exc:
-            raise click.ClickException(
-                f"Failed to update manifest: {exc}"
-            ) from exc
-
-    # Clean up orphaned bundles in bundles/ folder.
+    # Bundle files that nothing will reference once the manifest points at
+    # the compacted bundle alone: the old ones, plus orphans left by failed
+    # pushes.  Listed before the manifest update, so bundles that concurrent
+    # pushes upload later are never touched.
+    old_bundles = {entry.file_id: entry.id for entry in manifest.bundles}
     try:
-        all_bundle_files = client.list_files(bundles_folder_id)
-        valid_ids = {new_file_id}
-        orphans = [f for f in all_bundle_files if f["id"] not in valid_ids]
-        for orphan in orphans:
-            try:
-                client.delete_file(orphan["id"])
-            except DriveApiError:
-                click.echo(
-                    click.style(
-                        f"  Warning: could not delete orphan bundle {orphan['name']}",
-                        fg="yellow",
-                    )
-                )
-        if orphans:
-            click.echo(f"  Cleaned up {len(orphans)} orphaned bundle(s)")
+        orphans = {
+            f["id"]: f["name"]
+            for f in client.list_files(bundles_folder_id)
+            if f["id"] not in old_bundles and f["id"] != new_file_id
+        }
     except DriveApiError:
-        pass  # Best effort.
+        orphans = {}  # They stay until the next gc.
+
+    # Update manifest: single bundle, same refs — unless a push landed since
+    # it was read.  Nothing is deleted before this succeeds.
+    manifest.bundles = [
+        BundleEntry(
+            id=new_bundle_id,
+            file_id=new_file_id,
+        )
+    ]
+    manifest.updated_at = Manifest.new(repo).updated_at
+
+    try:
+        store.save(manifest)
+    except ManifestConflictError as exc:
+        try:
+            client.delete_file(new_file_id)  # Referenced nowhere.
+        except DriveApiError:
+            pass  # An orphan bundle; the next gc removes it.
+        raise click.ClickException(
+            "The manifest on Drive changed during gc (a push landed?), so "
+            f"nothing was changed. Run 'gitdrive gc {repo}' again."
+        ) from exc
+    except DriveApiError as exc:
+        raise click.ClickException(f"Failed to update manifest: {exc}") from exc
+
+    # Delete the bundles the manifest no longer references.
+    for file_id, bundle_id in old_bundles.items():
+        try:
+            client.delete_file(file_id)
+        except DriveApiError:
+            click.echo(
+                click.style(
+                    f"  Warning: could not delete old bundle {bundle_id}",
+                    fg="yellow",
+                )
+            )
+
+    for file_id, name in orphans.items():
+        try:
+            client.delete_file(file_id)
+        except DriveApiError:
+            click.echo(
+                click.style(
+                    f"  Warning: could not delete orphan bundle {name}",
+                    fg="yellow",
+                )
+            )
+    if orphans:
+        click.echo(f"  Cleaned up {len(orphans)} orphaned bundle(s)")
 
     # Clean up sync-lock if present.
     try:
@@ -581,15 +618,8 @@ def browse(ctx: click.Context, branch: str | None, repo_name: str | None) -> Non
             f"Repository '{repo_name}' exists but has no .gitdrive metadata."
         )
 
-    manifest_file_id = client.find_file("manifest.json", parent_id=gitdrive_id)
-    if manifest_file_id is None:
-        raise click.ClickException(f"Repository '{repo_name}' has no manifest.json.")
-
-    try:
-        raw = client.download_file(manifest_file_id)
-        manifest = Manifest.from_json(raw.decode("utf-8"))
-    except (DriveApiError, ManifestError) as exc:
-        raise click.ClickException(f"Failed to read manifest: {exc}") from exc
+    store = ManifestStore(client, gitdrive_id)
+    manifest = _load_manifest(store, repo_name)
 
     # Show current browsable ref if no branch specified.
     if branch is None:
@@ -625,16 +655,7 @@ def browse(ctx: click.Context, branch: str | None, repo_name: str | None) -> Non
     # Update manifest and upload.
     manifest.browsable_ref = new_ref
     manifest.updated_at = Manifest.new(repo_name).updated_at
-
-    try:
-        client.upload_file(
-            name="manifest.json",
-            content=manifest.to_json().encode("utf-8"),
-            parent_id=gitdrive_id,
-            existing_file_id=manifest_file_id,
-        )
-    except DriveApiError as exc:
-        raise click.ClickException(f"Failed to update manifest: {exc}") from exc
+    _save_manifest(store, manifest, f"gitdrive browse {branch} --repo {repo_name}")
 
     click.echo(
         f"Done — files on Drive now show "
@@ -678,15 +699,8 @@ def sync(ctx: click.Context, repo_name: str | None) -> None:
             f"Repository '{repo_name}' exists but has no .gitdrive metadata."
         )
 
-    manifest_file_id = client.find_file("manifest.json", parent_id=gitdrive_id)
-    if manifest_file_id is None:
-        raise click.ClickException(f"Repository '{repo_name}' has no manifest.")
-
-    try:
-        raw = client.download_file(manifest_file_id)
-        manifest = Manifest.from_json(raw.decode("utf-8"))
-    except (DriveApiError, ManifestError) as exc:
-        raise click.ClickException(f"Failed to read manifest: {exc}") from exc
+    store = ManifestStore(client, gitdrive_id)
+    manifest = _load_manifest(store, repo_name)
 
     browsable = manifest.resolve_browsable_ref()
     if browsable is None:
@@ -718,17 +732,7 @@ def sync(ctx: click.Context, repo_name: str | None) -> None:
     if manifest.browsable_ref != browsable:
         manifest.browsable_ref = browsable
         manifest.updated_at = Manifest.new(repo_name).updated_at
-        try:
-            client.upload_file(
-                name="manifest.json",
-                content=manifest.to_json().encode("utf-8"),
-                parent_id=gitdrive_id,
-                existing_file_id=manifest_file_id,
-            )
-        except DriveApiError as exc:
-            raise click.ClickException(
-                f"Failed to update manifest: {exc}"
-            ) from exc
+        _save_manifest(store, manifest, f"gitdrive sync --repo {repo_name}")
 
     click.echo(
         f"Done — Drive files now show "
