@@ -31,9 +31,15 @@ dependencies = [
     "cryptography>=41.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [project.scripts]
 gitdrive = "gitdrive.cli.commands:cli"
 "git-remote-gdrive" = "gitdrive.remote.helper:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gitdrive"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

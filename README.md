@@ -18,7 +18,7 @@ No servers, no third-party services — just your code and your Drive.
 - **Clone from Drive** — clone repositories from Google Drive with `gitdrive clone`
 - **Browsable files** — your repository files are synced as real files on Drive, viewable and shareable from the Drive UI
 - **Switchable browsable branch** — choose which branch is shown as browsable files on Drive
-- **Incremental bundles** — only changed data is uploaded on each push, keeping transfers fast and storage efficient
+- **Incremental bundles** — only changed data is uploaded on each push, keeping transfers fast and storage efficient; a push that brings no new objects (e.g. fast-forwarding a branch onto an already pushed commit) just updates the ref
 - **Encrypted token storage** — OAuth tokens are encrypted at rest using a machine-derived key
 - **Minimal permissions** — requests only the Drive file scope needed to manage GitDrive folders
 - **No server required** — everything runs locally on your machine
@@ -398,6 +398,13 @@ Instead of uploading the entire repository on every push, GitDrive uses
 snapshots. Each push generates a thin bundle containing only the new objects
 since the last push. On pull, bundles are fetched and applied in order.
 
+When Drive already has every object a pushed ref needs — `main` fast-forwarded
+onto a commit that was pushed with another branch, or a new branch or
+lightweight tag on a pushed commit — no bundle is created: only the ref in the
+manifest is updated. (An annotated tag always brings its new tag object, so it
+gets a tiny bundle of its own.) A fetch applies every bundle it has not applied
+yet, whichever refs they were created for, so such refs resolve like any other.
+
 ### Browsable File Sync
 
 In addition to the Git bundle data, GitDrive syncs a snapshot of your working
@@ -415,11 +422,10 @@ My Drive/
     my-project/
       .gitdrive/
         bundles/
-          0001-abc1234.bundle     # Initial full bundle
-          0002-def5678.bundle     # Incremental bundle
-          0003-...                # ...
-        manifest.json             # Bundle metadata & ordering
-        refs.json                 # Current ref state (branches, tags)
+          0001.bundle             # Initial full bundle
+          0002.bundle             # Incremental bundle
+          0003.bundle             # ...
+        manifest.json             # Refs and bundle metadata
       README.md                   # Browsable file
       src/                        # Browsable directory
         main.py
@@ -427,8 +433,8 @@ My Drive/
 ```
 
 - **`.gitdrive/bundles/`** — Contains sequentially numbered Git bundle files
-- **`manifest.json`** — Tracks bundle order, checksums, and prerequisites
-- **`refs.json`** — Maps branch and tag names to commit SHAs
+- **`manifest.json`** — Maps branch and tag names to their SHAs, and tracks
+  bundle order, checksums, and prerequisites
 - **Root-level files** — Mirror of the repository's working tree for browsing
 
 ## Troubleshooting
@@ -501,6 +507,17 @@ gitdrive browse master
 Google Drive API has usage quotas. GitDrive handles transient rate limits
 automatically with exponential backoff. If the error persists, wait a few
 minutes before retrying.
+
+## Development
+
+The test suite runs the remote helper against local Git repositories and an
+in-memory fake of Google Drive — it never talks to your real Drive, and it
+keeps Git and GitDrive away from your own configuration and tokens.
+
+```bash
+.venv/bin/pip install -e '.[dev]'
+.venv/bin/python -m pytest
+```
 
 ## License
 

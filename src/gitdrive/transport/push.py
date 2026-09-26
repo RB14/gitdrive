@@ -92,7 +92,13 @@ class PushHandler:
     # ── single-refspec push ──────────────────────────────────────────
 
     def _push_one(self, refspec: Refspec, tmp: Path) -> None:
-        """Push a single refspec: bundle, upload, update manifest."""
+        """Push a single refspec: bundle, upload, update manifest.
+
+        When Drive already holds every object the ref needs (e.g. a branch
+        fast-forwarded onto a commit pushed with another branch, or a
+        lightweight tag on a pushed commit), no bundle is created and only
+        the ref is recorded in the manifest.
+        """
         branch = refspec.src.removeprefix("refs/heads/")
 
         # 1. Resolve source ref to a SHA.
@@ -101,16 +107,71 @@ class PushHandler:
         # 2. Determine remote SHAs to exclude (incremental bundling).
         exclude_shas = self._get_exclude_shas()
 
-        # 3. Create the git bundle.
+        # 3. Bundle and upload the objects Drive lacks, if there are any.
+        if exclude_shas and not self._has_new_objects(refspec.src, exclude_shas):
+            self._msg(f"  No new objects for {branch} — updating ref only")
+            entry = None
+        else:
+            entry = self._upload_bundle(refspec.src, branch, exclude_shas, tmp)
+
+        # 4. Sync browsable files if this push updates the browsable ref.
+        #    On first push (no refs yet), adopt the pushed branch as the
+        #    browsable ref so files appear on Drive immediately.
+        if not self._manifest.refs:
+            self._manifest.browsable_ref = refspec.dst
+
+        needs_sync = refspec.dst == self._manifest.browsable_ref
+        sync_lock_written = False
+
+        if needs_sync:
+            old_sha = self._manifest.refs.get(refspec.dst)
+
+            # 4a. Check for interrupted sync → force authoritative full sync.
+            if self._check_sync_lock():
+                self._msg("  Detected interrupted sync — forcing full sync")
+                old_sha = None
+
+            # 4b. Write sync-lock before starting browsable sync.
+            self._write_sync_lock()
+            sync_lock_written = True
+
+            # 4c. Sync browsable files.
+            self._sync_browsable(old_sha, src_sha)
+
+        # 5. Update manifest in memory.
+        if entry is not None:
+            self._manifest.add_bundle(entry)
+        self._manifest.update_refs({refspec.dst: src_sha})
+        self._manifest.updated_at = _utcnow_iso()
+
+        # 6. Upload manifest to Drive.
+        self._msg("  Updating manifest...")
+        self._upload_manifest()
+
+        # 7. Delete sync-lock (Drive is now consistent).
+        if sync_lock_written:
+            self._delete_sync_lock()
+
+        self._msg(f"  {refspec.dst} -> {src_sha[:8]}")
+
+    def _upload_bundle(
+        self, ref: str, branch: str, exclude_shas: list[str], tmp: Path
+    ) -> BundleEntry:
+        """Bundle *ref* minus *exclude_shas*, upload it, and return its entry.
+
+        The entry is not added to the manifest; the caller does that once
+        the rest of the push has succeeded.
+        """
+        # 1. Create the git bundle.
         self._msg(f"  Creating bundle for {branch}...")
         bundle_id = self._manifest.next_bundle_id()
         bundle_path = tmp / f"{bundle_id}.bundle"
-        self._create_bundle(bundle_path, refspec.src, exclude_shas)
+        self._create_bundle(bundle_path, ref, exclude_shas)
 
-        # 4. Compute checksum.
+        # 2. Compute checksum.
         checksum = self._compute_checksum(bundle_path)
 
-        # 5. Upload the bundle to Drive.
+        # 3. Upload the bundle to Drive.
         bundle_bytes = bundle_path.read_bytes()
         size = len(bundle_bytes)
         self._msg(f"  Uploading bundle ({self._fmt_size(size)})...")
@@ -123,51 +184,12 @@ class PushHandler:
         elapsed = time.monotonic() - t0
         self._msg(f"  Uploaded bundle — {self._fmt_speed(size, elapsed)}")
 
-        # 6. Sync browsable files if this push updates the browsable ref.
-        #    On first push (no refs yet), adopt the pushed branch as the
-        #    browsable ref so files appear on Drive immediately.
-        if not self._manifest.refs:
-            self._manifest.browsable_ref = refspec.dst
-
-        needs_sync = refspec.dst == self._manifest.browsable_ref
-        sync_lock_written = False
-
-        if needs_sync:
-            old_sha = self._manifest.refs.get(refspec.dst)
-
-            # 6a. Check for interrupted sync → force authoritative full sync.
-            if self._check_sync_lock():
-                self._msg("  Detected interrupted sync — forcing full sync")
-                old_sha = None
-
-            # 6b. Write sync-lock before starting browsable sync.
-            self._write_sync_lock()
-            sync_lock_written = True
-
-            # 6c. Sync browsable files.
-            self._sync_browsable(old_sha, src_sha)
-
-        # 7. Update manifest in memory.
-        prerequisite_ids = [b.id for b in self._manifest.bundles]
-        entry = BundleEntry(
+        return BundleEntry(
             id=bundle_id,
             file_id=file_id,
-            prerequisites=prerequisite_ids,
+            prerequisites=[b.id for b in self._manifest.bundles],
             checksum=f"sha256:{checksum}",
         )
-        self._manifest.add_bundle(entry)
-        self._manifest.update_refs({refspec.dst: src_sha})
-        self._manifest.updated_at = _utcnow_iso()
-
-        # 8. Upload manifest to Drive.
-        self._msg("  Updating manifest...")
-        self._upload_manifest()
-
-        # 9. Delete sync-lock (Drive is now consistent).
-        if sync_lock_written:
-            self._delete_sync_lock()
-
-        self._msg(f"  {refspec.dst} -> {src_sha[:8]}")
 
     # ── git helpers ──────────────────────────────────────────────────
 
@@ -200,6 +222,34 @@ class PushHandler:
             if result.returncode == 0:
                 valid.append(sha)
         return valid
+
+    def _has_new_objects(self, ref: str, exclude_shas: list[str]) -> bool:
+        """Return ``True`` if *ref* reaches objects not reachable from *exclude_shas*.
+
+        ``False`` means an incremental bundle would be empty (``git bundle
+        create`` refuses those), so Drive already has everything *ref* needs.
+        """
+        excludes = [f"^{sha}" for sha in exclude_shas]
+
+        # Any new commit settles it; --max-count keeps this cheap on big pushes.
+        if self._rev_list(["--max-count=1", ref, *excludes]):
+            return True
+
+        # No new commits, but the ref may still add a non-commit object,
+        # e.g. an annotated tag object pointing at a commit Drive has.
+        return bool(self._rev_list(["--objects", ref, *excludes]))
+
+    @staticmethod
+    def _rev_list(args: list[str]) -> str:
+        """Run ``git rev-list`` with *args* and return its output."""
+        result = subprocess.run(
+            ["git", "rev-list", *args],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise BundleError(f"git rev-list failed: {result.stderr.strip()}")
+        return result.stdout.strip()
 
     def _create_bundle(
         self, path: Path, ref: str, exclude_shas: list[str]
