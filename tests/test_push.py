@@ -234,3 +234,89 @@ def test_first_push_does_not_overwrite_a_manifest_created_meanwhile(repo, remote
     assert remote.push(MAIN) == {"refs/heads/main": CONFLICT}
     assert remote.manifest().refs == {"refs/heads/other": sha}
     assert remote.drive.listing(REPO_NAME, ".gitdrive", "bundles") == []
+
+
+def _push_two_commits_then_rewrite(remote: Remote) -> tuple[str, str]:
+    """Push main twice, then replace its last commit locally (a rewrite that
+    needs a forced push).  Return ``(first pushed commit, main on Drive)``."""
+    first = git("rev-parse", "main")
+    remote.push(MAIN)
+    on_drive = commit("a.txt")
+    remote.push(MAIN)
+    git("reset", "-q", "--hard", "HEAD~1")
+    commit("rewritten.txt")
+    return first, on_drive
+
+
+def test_lease_option_is_accepted(repo, remote):
+    assert remote.option(f"cas refs/heads/main:{'0' * 40}") == "ok"
+    assert remote.option("cas refs/heads/main") == "ok"
+
+
+def test_forced_push_with_a_holding_lease_goes_through(repo, remote):
+    _, on_drive = _push_two_commits_then_rewrite(remote)
+
+    replies = remote.push("+" + MAIN, options=(f"cas refs/heads/main:{on_drive}",))
+
+    assert replies == {"refs/heads/main": "ok"}
+    assert remote.manifest().refs["refs/heads/main"] == git("rev-parse", "main")
+
+
+def test_forced_push_with_a_stale_lease_is_rejected(repo, remote):
+    first, on_drive = _push_two_commits_then_rewrite(remote)
+
+    replies = remote.push("+" + MAIN, options=(f"cas refs/heads/main:{first}",))
+
+    assert replies == {"refs/heads/main": "error stale info"}
+    assert remote.manifest().refs["refs/heads/main"] == on_drive
+
+
+def test_lease_is_checked_against_drive_at_push_time(repo, remote):
+    first, on_drive = _push_two_commits_then_rewrite(remote)
+
+    # The lease held when git listed the refs; then another push moved main.
+    replies = remote.push(
+        "+" + MAIN,
+        options=(f"cas refs/heads/main:{on_drive}",),
+        meanwhile=lambda: remote.update_manifest(
+            lambda m: m.update_refs({"refs/heads/main": first})
+        ),
+    )
+
+    assert replies == {"refs/heads/main": "error stale info"}
+    assert remote.manifest().refs["refs/heads/main"] == first
+
+
+def test_lease_that_the_ref_must_not_exist(repo, remote):
+    remote.push(MAIN)
+    git("branch", "new")
+    absent = f"cas refs/heads/new:{'0' * 40}"
+
+    assert remote.push("refs/heads/new:refs/heads/new", options=(absent,)) == {
+        "refs/heads/new": "ok"
+    }
+    assert remote.push("+refs/heads/new:refs/heads/new", options=(absent,)) == {
+        "refs/heads/new": "error stale info"
+    }
+
+
+def test_bare_lease_expects_the_remote_tracking_ref(repo, remote):
+    git("remote", "add", "gdrive", f"gdrive://{REPO_NAME}")
+    first, on_drive = _push_two_commits_then_rewrite(remote)
+
+    git("update-ref", "refs/remotes/gdrive/main", first)  # an outdated view
+    assert remote.push("+" + MAIN, options=("cas refs/heads/main",)) == {
+        "refs/heads/main": "error stale info"
+    }
+
+    git("update-ref", "refs/remotes/gdrive/main", on_drive)
+    assert remote.push("+" + MAIN, options=("cas refs/heads/main",)) == {
+        "refs/heads/main": "ok"
+    }
+
+
+def test_forced_push_without_a_lease_overwrites(repo, remote):
+    _push_two_commits_then_rewrite(remote)
+
+    assert remote.push("+" + MAIN) == {"refs/heads/main": "ok"}
+    assert remote.manifest().refs["refs/heads/main"] == git("rev-parse", "main")

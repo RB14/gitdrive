@@ -49,6 +49,13 @@ class ManifestStore:
         self._file_id, self._revision = file_id, revision
         return manifest
 
+    def read_current(self) -> Manifest | None:
+        """Download Drive's manifest as it is now, leaving the base alone."""
+        file_id = self._client.find_file(self.FILE_NAME, parent_id=self._folder_id)
+        if file_id is None:
+            return None
+        return Manifest.from_json(self._client.download_file(file_id).decode("utf-8"))
+
     def check(self) -> None:
         """Raise :class:`ManifestConflictError` if Drive's manifest left the base."""
         file_id = self._client.find_file(self.FILE_NAME, parent_id=self._folder_id)

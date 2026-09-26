@@ -13,6 +13,8 @@ reserved for user-facing progress output.
 
 from __future__ import annotations
 
+import ast
+import subprocess
 import sys
 from dataclasses import dataclass
 
@@ -58,6 +60,9 @@ class RemoteHelper:
         self._manifest_loaded: bool = False
 
         self._options: dict[str, str] = {}
+        # From ``option cas`` (--force-with-lease): ref → the SHA it must
+        # still have on Drive when pushed (``None``: it must not exist).
+        self._leases: dict[str, str | None] = {}
 
     # ── Main loop ────────────────────────────────────────────────────
 
@@ -100,7 +105,11 @@ class RemoteHelper:
         name = parts[1] if len(parts) > 1 else ""
         value = parts[2] if len(parts) > 2 else ""
 
-        if name in self._KNOWN_OPTIONS:
+        if name == "cas":
+            refname, expected = self._parse_lease(value)
+            self._leases[refname] = expected
+            self._respond("ok")
+        elif name in self._KNOWN_OPTIONS:
             self._options[name] = value
             self._respond("ok")
         else:
@@ -172,6 +181,7 @@ class RemoteHelper:
             manifest=self._get_manifest(),
             repo_name=self._repo_name,
             manifest_store=self._manifest_store,
+            leases=self._leases,
         )
         results: list[tuple[Refspec, str | None]] = handler.push(refspecs)
 
@@ -202,6 +212,42 @@ class RemoteHelper:
             spec = spec[1:]
         src, dst = spec.split(":", 1)
         return Refspec(src=src, dst=dst, force=force)
+
+    def _parse_lease(self, value: str) -> tuple[str, str | None]:
+        """Parse an ``option cas`` value into ``(refname, expected SHA)``.
+
+        Git sends ``<ref>:<object name>`` (all zeros: the ref must not
+        exist).  As with git's own ``--force-with-lease``, an expected value
+        is resolved locally, and a bare ``<ref>`` expects its remote-tracking
+        ref (or no ref, without one).  An expectation that does not resolve
+        is kept as given, so it never matches and the push is refused.
+        """
+        refname, sep, expected = _unquote_c_style(value).partition(":")
+        if not sep:
+            tracking = self._tracking_ref(refname)
+            return refname, _rev_parse(tracking) if tracking else None
+        if not expected.strip("0"):
+            return refname, None
+        return refname, _rev_parse(expected) or expected
+
+    def _tracking_ref(self, refname: str) -> str | None:
+        """Map remote *refname* through this remote's fetch refspecs."""
+        result = subprocess.run(
+            ["git", "config", "--get-all", f"remote.{self._remote_name}.fetch"],
+            capture_output=True,
+            text=True,
+        )
+        for spec in result.stdout.split():
+            src, _, dst = spec.removeprefix("+").partition(":")
+            if "*" not in src:
+                if src == refname and dst:
+                    return dst
+                continue
+            prefix, suffix = src.split("*", 1)
+            middle = refname[len(prefix):len(refname) - len(suffix)]
+            if refname.startswith(prefix) and refname.endswith(suffix) and middle:
+                return dst.replace("*", middle, 1)
+        return None
 
     @staticmethod
     def _parse_fetch_line(line: str) -> tuple[str, str]:
@@ -277,6 +323,26 @@ class RemoteHelper:
         if loaded is None:
             return Manifest.new(self._repo_name)
         return loaded
+
+
+def _unquote_c_style(value: str) -> str:
+    """Undo git's C-style quoting of an option value (e.g. non-ASCII refs)."""
+    if len(value) < 2 or not (value.startswith('"') and value.endswith('"')):
+        return value
+    try:
+        return ast.literal_eval(f"b{value}").decode("utf-8")
+    except (SyntaxError, ValueError, UnicodeDecodeError):
+        return value
+
+
+def _rev_parse(rev: str) -> str | None:
+    """Resolve *rev* to an object name in the local repo (``None`` if not)."""
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", rev],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
 
 
 def main() -> None:

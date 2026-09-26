@@ -10,7 +10,7 @@ import json
 import subprocess
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -222,19 +222,37 @@ class Remote:
                 return line[1:].removesuffix(" HEAD")
         return None
 
-    def push(self, *refspecs: str) -> dict[str, str]:
+    def push(
+        self,
+        *refspecs: str,
+        options: tuple[str, ...] = (),
+        meanwhile: Callable[[], None] | None = None,
+    ) -> dict[str, str]:
         """Push *refspecs* in one batch; map each destination to its reply.
 
-        A reply is ``"ok"`` or ``"error <why>"``.
+        A reply is ``"ok"`` or ``"error <why>"``.  *options* are sent as
+        ``option`` lines after ``list for-push``, as git does; *meanwhile*
+        runs after that listing, before the push — like another writer
+        landing after git has read the refs.
         """
-        replies = self._run("list for-push", *(f"push {s}" for s in refspecs), "")
+        replies = self._run(
+            "list for-push",
+            *(f"option {o}" for o in options),
+            *(f"push {s}" for s in refspecs),
+            "",
+            meanwhile=meanwhile,
+        )
         statuses: dict[str, str] = {}
         for line in replies:
             status, _, rest = line.partition(" ")
-            if status in ("ok", "error"):
+            if status in ("ok", "error") and rest:  # not an option's reply
                 dst, _, why = rest.partition(" ")
                 statuses[dst] = f"{status} {why}".rstrip()
         return statuses
+
+    def option(self, option: str) -> str:
+        """Send ``option <option>`` and return the helper's reply."""
+        return self._run(f"option {option}")[0]
 
     def clone(self, path: Path) -> dict[str, str]:
         """Like ``git clone``: init *path*, then :meth:`fetch_all` into it."""
@@ -282,11 +300,22 @@ class Remote:
         return [b.id for b in self.manifest().bundles]
 
     @staticmethod
-    def _run(*commands: str) -> list[str]:
-        """Feed *commands* to a fresh helper and return its stdout lines."""
-        stdin = io.StringIO("".join(f"{c}\n" for c in commands))
+    def _run(*commands: str, meanwhile: Callable[[], None] | None = None) -> list[str]:
+        """Feed *commands* to a fresh helper and return its stdout lines.
+
+        *meanwhile* runs right before the helper reads the first ``push``.
+        """
+
+        def stdin() -> Iterator[str]:
+            hook = meanwhile
+            for command in commands:
+                if hook and command.startswith("push "):
+                    hook()
+                    hook = None
+                yield f"{command}\n"
+
         stdout = io.StringIO()
-        with patch.object(sys, "stdin", stdin), patch.object(sys, "stdout", stdout):
+        with patch.object(sys, "stdin", stdin()), patch.object(sys, "stdout", stdout):
             RemoteHelper("gdrive", f"gdrive://{REPO_NAME}").run()
         return stdout.getvalue().splitlines()
 

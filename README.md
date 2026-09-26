@@ -19,6 +19,7 @@ No servers, no third-party services — just your code and your Drive.
 - **Browsable files** — your repository files are synced as real files on Drive, viewable and shareable from the Drive UI
 - **Switchable browsable branch** — choose which branch is shown as browsable files on Drive
 - **Remote ref deletion** — remove branches and tags from Drive with `git push gdrive --delete <ref>`
+- **Safe force pushes** — `git push --force-with-lease` is honored, and checked against Drive at push time
 - **Incremental bundles** — only changed data is uploaded on each push, keeping transfers fast and storage efficient; a push that brings no new objects (e.g. fast-forwarding a branch onto an already pushed commit) just updates the ref
 - **Encrypted token storage** — OAuth tokens are encrypted at rest using a machine-derived key
 - **Minimal permissions** — requests only the Drive file scope needed to manage GitDrive folders
@@ -436,6 +437,11 @@ writer's refs and bundles. A push that loses such a race fails its refs with
 `the manifest on Drive changed since it was read; fetch and push again`, and
 removes the bundle it had uploaded. (Drive has no atomic compare-and-swap, so
 two writes landing in the very same instant can still collide.)
+
+`git push --force-with-lease` works as on any remote. Git itself rejects a
+lease that disagrees with the refs it listed; GitDrive then checks each lease
+again against the manifest on Drive right before pushing, so a push that
+landed in between is rejected with `stale info` as well.
 
 ### Browsable File Sync
 

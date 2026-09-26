@@ -34,6 +34,7 @@ class PushHandler:
         manifest: Manifest,
         repo_name: str,
         manifest_store: ManifestStore | None = None,
+        leases: dict[str, str | None] | None = None,
     ) -> None:
         self._config = config
         self._client = client
@@ -42,6 +43,9 @@ class PushHandler:
         # Where *manifest* was loaded from; ``None`` if no manifest existed
         # yet (_ensure_repo_structure() then creates an empty-based store).
         self._store = manifest_store
+        # --force-with-lease: ref → the SHA it must still have on Drive
+        # (``None``: it must not exist).
+        self._leases = leases or {}
 
         # Populated by _ensure_repo_structure().
         self._repo_folder_id: str | None = None
@@ -121,7 +125,9 @@ class PushHandler:
         """
         branch = refspec.src.removeprefix("refs/heads/")
 
-        # 0. Fail fast if another push changed the manifest since we read it.
+        # 0. Fail fast if the ref's lease no longer holds, or another push
+        #    changed the manifest since we read it.
+        self._check_lease(refspec.dst)
         self._store.check()
 
         # 1. Resolve source ref to a SHA.
@@ -230,6 +236,7 @@ class PushHandler:
         them.  The ref the remote HEAD points to — the browsable branch —
         cannot be deleted, as its files are what Drive shows.
         """
+        self._check_lease(refspec.dst)
         self._store.check()
 
         if refspec.dst not in self._manifest.refs:
@@ -248,6 +255,22 @@ class PushHandler:
         self._store.save(self._manifest)
 
         self._msg(f"  {refspec.dst} deleted")
+
+    # ── lease ────────────────────────────────────────────────────────
+
+    def _check_lease(self, ref: str) -> None:
+        """Reject *ref* with ``stale info`` if Drive no longer matches its lease.
+
+        Checked against a fresh read of Drive's manifest: git has already
+        compared the lease with the refs it listed, but another push may have
+        landed since.  From here on, the checked manifest save catches any
+        later change.
+        """
+        if ref not in self._leases:
+            return
+        current = self._store.read_current()
+        if (current.refs.get(ref) if current else None) != self._leases[ref]:
+            raise PushRejectedError("stale info")
 
     # ── git helpers ──────────────────────────────────────────────────
 
