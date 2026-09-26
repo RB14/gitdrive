@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import tempfile
 from pathlib import Path
@@ -457,13 +458,19 @@ def gc(ctx: click.Context, repo: str) -> None:
                     f"Failed to unbundle {entry.id}: {result.stderr.strip()}"
                 )
 
-        # Update refs in the bare repo to match the manifest.
+        # Update refs in the bare repo to match the manifest.  A ref that
+        # cannot be set would be missing from the compacted bundle — abort.
         for ref, sha in manifest.refs.items():
-            subprocess.run(
+            result = subprocess.run(
                 ["git", "-C", str(bare_repo), "update-ref", ref, sha],
                 capture_output=True,
                 text=True,
             )
+            if result.returncode != 0:
+                raise click.ClickException(
+                    f"Bundles on Drive do not hold {ref} ({_short_sha(sha)}): "
+                    f"{result.stderr.strip()}"
+                )
 
         # Create a single compacted bundle from the bare repo.
         compacted_path = tmp / "compacted.bundle"
@@ -487,9 +494,10 @@ def gc(ctx: click.Context, repo: str) -> None:
 
         compacted_bytes = compacted_path.read_bytes()
 
-        # Upload the new compacted bundle.
+        # Upload the new compacted bundle.  It takes a fresh ID: clones have
+        # recorded the old IDs as applied and would skip a reused one.
         bundles_folder_id = client.ensure_folder("bundles", parent_id=gitdrive_id)
-        new_bundle_id = "0001"
+        new_bundle_id = manifest.next_bundle_id()
         try:
             new_file_id = client.upload_file(
                 name=f"{new_bundle_id}.bundle",
@@ -521,6 +529,7 @@ def gc(ctx: click.Context, repo: str) -> None:
         BundleEntry(
             id=new_bundle_id,
             file_id=new_file_id,
+            checksum=f"sha256:{hashlib.sha256(compacted_bytes).hexdigest()}",
         )
     ]
     manifest.updated_at = Manifest.new(repo).updated_at

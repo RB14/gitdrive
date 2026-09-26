@@ -28,6 +28,23 @@ def test_gc_compacts_the_bundles_into_one(repo, remote, tmp_path):
     assert remote.clone(tmp_path / "clone") == {"refs/heads/main": main}
 
 
+def test_gc_never_reuses_a_bundle_id_an_existing_clone_applied(repo, remote, tmp_path):
+    _push_three_bundles(remote)
+    clone = tmp_path / "clone"
+    remote.clone(clone)  # records 0001-0003 as applied
+    assert gitdrive("gc", REPO_NAME).exit_code == 0
+    tip = commit("c.txt")
+    remote.push(MAIN)
+
+    refs = remote.fetch_all(clone)
+
+    assert refs == {"refs/heads/main": tip}
+    # The compacted bundle and the push after it got IDs never issued before,
+    # and the clone forgot the records of bundles that are gone.
+    assert remote.bundle_ids() == ["0004", "0005"]
+    assert remote.applied_bundles(clone) == ["0004", "0005"]
+
+
 def test_gc_does_not_overwrite_a_manifest_changed_meanwhile(repo, remote):
     main = _push_three_bundles(remote)
     # A push lands while gc uploads the compacted bundle.

@@ -326,9 +326,11 @@ bundle to reclaim Drive storage.
 gitdrive gc my-project
 ```
 
-The old bundles are deleted only once the manifest points at the compacted
-one. If a push lands while `gc` runs, `gc` changes nothing and asks you to run
-it again.
+The compacted bundle takes the next bundle ID instead of restarting at `0001`,
+so existing clones — which record the bundle IDs they have applied — download
+it rather than mistake it for one they already have. The old bundles are deleted only
+once the manifest points at the compacted one. If a push lands while `gc`
+runs, `gc` changes nothing and asks you to run it again.
 
 ### `gitdrive browse [branch] [--repo NAME]`
 
@@ -418,6 +420,12 @@ manifest is updated. (An annotated tag always brings its new tag object, so it
 gets a tiny bundle of its own.) A fetch applies every bundle it has not applied
 yet, whichever refs they were created for, so such refs resolve like any other.
 For the same reason, deleting a ref leaves its bundles in the chain.
+
+Each clone records which bundles it has applied (in
+`.git/gitdrive/applied_bundles.json`) so later fetches download only new ones.
+That record is only a shortcut: when it made a fetch skip bundles, the fetched
+objects are checked, and if some are missing the fetch applies every bundle
+again and fixes the record. Records of bundles no longer on Drive are dropped.
 
 ### Concurrent Updates
 
@@ -539,6 +547,14 @@ git push gdrive main
 
 `gitdrive gc`, `browse`, and `sync` fail the same way and can simply be run
 again.
+
+### "Bundles recorded as applied are missing locally"
+
+A fetch found that your clone's record of applied bundles did not match Drive,
+so it re-applied all bundles and fixed the record — nothing to do. It happens
+once in clones of a repository compacted by an older `gitdrive gc`, which
+renumbered the compacted bundle `0001` and so reissued bundle IDs that clones
+had already recorded.
 
 ### "Rate limit exceeded"
 

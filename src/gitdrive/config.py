@@ -158,51 +158,31 @@ class GitDriveConfig:
         ``<git-dir>/gitdrive/applied_bundles.json`` so the tracking is
         naturally scoped to the local repository.
         """
-        path = self._applied_bundles_file()
-        if path is None or not path.exists():
-            return []
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return list(data.get(repo, []))
-        except (json.JSONDecodeError, OSError):
-            return []
+        return list(self._read_applied_bundles().get(repo, []))
 
     def mark_bundle_applied(self, repo: str, bundle_id: str) -> None:
         """Record *bundle_id* as applied for *repo* and persist.
 
         Written atomically to ``<git-dir>/gitdrive/applied_bundles.json``.
         """
-        path = self._applied_bundles_file()
-        if path is None:
-            return  # Not in a git repo — nothing to track.
-
-        # Load existing data.
-        if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                data = {}
-        else:
-            data = {}
-
+        data = self._read_applied_bundles()
         repo_bundles: list[str] = data.setdefault(repo, [])
         if bundle_id not in repo_bundles:
             repo_bundles.append(bundle_id)
+            self._write_applied_bundles(data)
 
-        # Atomic write.
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        payload = json.dumps(data, indent=2) + "\n"
-        fd, tmp_path = tempfile.mkstemp(
-            dir=path.parent,
-            prefix=".applied_bundles_",
-            suffix=".tmp",
-        )
-        try:
-            os.write(fd, payload.encode("utf-8"))
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(tmp_path, path)
+    def forget_applied_bundles(self, repo: str, keep: set[str]) -> None:
+        """Drop the records of applied bundles for *repo* not in *keep*.
+
+        Called with the IDs a manifest lists, so that records of bundles
+        which are gone never linger to match a reissued ID later.
+        """
+        data = self._read_applied_bundles()
+        repo_bundles = data.get(repo, [])
+        kept = [bundle_id for bundle_id in repo_bundles if bundle_id in keep]
+        if kept != repo_bundles:
+            data[repo] = kept
+            self._write_applied_bundles(data)
 
     def get_repo_cache_dir(self, repo: str) -> Path:
         """Return the bundle-cache subdirectory for *repo*, creating it if needed."""
@@ -231,6 +211,36 @@ class GitDriveConfig:
         if git_dir is None:
             return None
         return git_dir / "gitdrive" / "applied_bundles.json"
+
+    def _read_applied_bundles(self) -> dict[str, list[str]]:
+        """Load the applied bundles file (empty when absent or unreadable)."""
+        path = self._applied_bundles_file()
+        if path is None or not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def _write_applied_bundles(self, data: dict[str, list[str]]) -> None:
+        """Atomically write the applied bundles file (no-op outside a repo)."""
+        path = self._applied_bundles_file()
+        if path is None:
+            return  # Not in a git repo — nothing to track.
+
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        payload = json.dumps(data, indent=2) + "\n"
+        fd, tmp_path = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=".applied_bundles_",
+            suffix=".tmp",
+        )
+        try:
+            os.write(fd, payload.encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp_path, path)
 
     @staticmethod
     def _default_settings() -> dict[str, Any]:

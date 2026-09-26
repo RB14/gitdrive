@@ -10,8 +10,13 @@ from pathlib import Path
 
 from gitdrive.config import GitDriveConfig
 from gitdrive.drive.client import DriveClient
-from gitdrive.exceptions import BundleVerifyError, ChecksumMismatchError, DriveApiError
-from gitdrive.store.manifest import Manifest
+from gitdrive.exceptions import (
+    BundleError,
+    BundleVerifyError,
+    ChecksumMismatchError,
+    DriveApiError,
+)
+from gitdrive.store.manifest import BundleEntry, Manifest
 
 
 class FetchHandler:
@@ -36,19 +41,57 @@ class FetchHandler:
 
         Downloads unapplied bundles in order, verifies checksums, runs
         ``git bundle verify`` + ``unbundle``, and marks each as applied.
-        """
-        applied = set(self._config.get_applied_bundles(self._repo_name))
-        unapplied = [b for b in self._manifest.bundles if b.id not in applied]
 
-        if not unapplied:
+        The record of applied bundles only saves downloads; it is not
+        trusted blindly.  When it made the fetch skip bundles, the fetched
+        objects are checked, and if the record proves wrong — e.g. an older
+        ``gitdrive gc`` reissued IDs it lists — every bundle is applied
+        again.  Records of bundles no longer on Drive are then dropped.
+        """
+        bundles = self._manifest.bundles
+        recorded = set(self._config.get_applied_bundles(self._repo_name))
+        unapplied = [b for b in bundles if b.id not in recorded]
+        skipped_recorded = len(unapplied) < len(bundles)
+        wanted = [sha for sha, _ref in fetch_specs]
+        applied_now: set[str] = set()
+
+        try:
+            self._apply_bundles(unapplied, applied_now)
+            complete = not skipped_recorded or self._has_objects(wanted)
+        except BundleVerifyError:
+            if not skipped_recorded:
+                raise
+            complete = False  # A bundle it skipped is missing here after all.
+
+        if not complete:
+            self._msg(
+                "  Bundles recorded as applied are missing locally — "
+                "re-applying all bundles..."
+            )
+            self._apply_bundles(
+                [b for b in bundles if b.id not in applied_now], applied_now
+            )
+            if not self._has_objects(wanted):
+                raise BundleError(
+                    "Objects of the fetched refs are missing even after "
+                    "applying every bundle on Drive"
+                )
+
+        self._config.forget_applied_bundles(self._repo_name, {b.id for b in bundles})
+
+    # ── bundle application ───────────────────────────────────────────
+
+    def _apply_bundles(self, entries: list[BundleEntry], applied_now: set[str]) -> None:
+        """Download and apply *entries* in order, adding each ID to *applied_now*."""
+        if not entries:
             self._msg("  Everything up to date.")
             return
 
-        total = len(unapplied)
+        total = len(entries)
         self._msg(f"  Fetching {total} bundle{'s' if total != 1 else ''}...")
         cache_dir = self._config.get_repo_cache_dir(self._repo_name)
 
-        for idx, entry in enumerate(unapplied, 1):
+        for idx, entry in enumerate(entries, 1):
             bundle_path = cache_dir / f"{entry.id}.bundle"
 
             # 1. Download the bundle from Drive.
@@ -95,7 +138,24 @@ class FetchHandler:
 
             # 5. Mark as applied and clean up the cached bundle.
             self._config.mark_bundle_applied(self._repo_name, entry.id)
+            applied_now.add(entry.id)
             bundle_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _has_objects(shas: list[str]) -> bool:
+        """Return ``True`` if *shas* and every object they reach exist locally.
+
+        The same connectivity check git runs after a fetch; objects reachable
+        from local refs are taken as present.
+        """
+        if not shas:
+            return True
+        result = subprocess.run(
+            ["git", "rev-list", "--objects", "--quiet", *shas, "--not", "--all"],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
 
     # ── checksum verification ────────────────────────────────────────
 

@@ -6,6 +6,7 @@ import contextlib
 import fnmatch
 import io
 import itertools
+import json
 import subprocess
 import sys
 import threading
@@ -253,6 +254,12 @@ class Remote:
                 git("update-ref", ref, sha)
             git("fsck", "--connectivity-only", "--no-dangling")
         return refs
+
+    @staticmethod
+    def applied_bundles(path: Path) -> list[str]:
+        """Return the bundle IDs the clone at *path* has recorded as applied."""
+        record = path / ".git" / "gitdrive" / "applied_bundles.json"
+        return json.loads(record.read_text()).get(REPO_NAME, [])
 
     def manifest(self) -> Manifest:
         """Return the manifest currently stored on Drive."""

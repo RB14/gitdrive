@@ -72,7 +72,15 @@ class Manifest:
     # ── bundle helpers ──────────────────────────────────────────────
 
     def next_bundle_id(self) -> str:
-        """Return the next sequential zero-padded bundle ID."""
+        """Return the next sequential zero-padded bundle ID.
+
+        IDs must never be reissued: clones record the IDs they have applied
+        and skip those.  One past the highest listed ID is safe because only
+        ``gitdrive gc`` removes bundles, and it replaces them with a bundle
+        that takes the next ID itself, so the highest ID ever issued always
+        stays listed.  (An older gc restarted at 0001 and lost that; fetch
+        repairs the clones it misled.)
+        """
         if not self.bundles:
             return "0001"
         last = max(int(b.id) for b in self.bundles)
