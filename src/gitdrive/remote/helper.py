@@ -25,7 +25,10 @@ from gitdrive.store.manifest import Manifest
 
 @dataclass
 class Refspec:
-    """Parsed push refspec."""
+    """Parsed push refspec.
+
+    An empty *src* (``push :<dst>``) asks for *dst* to be deleted.
+    """
 
     src: str
     dst: str
@@ -149,7 +152,8 @@ class RemoteHelper:
         """Handle a push batch.
 
         Reads all ``push [+]<src>:<dst>`` lines until a blank line, then
-        delegates to the transport push handler.
+        delegates to the transport push handler.  An empty ``<src>`` deletes
+        ``<dst>``.  Reports ``ok <dst>`` or ``error <dst> <why>`` per ref.
         """
         refspecs = [self._parse_push_refspec(first_line)]
         for line in sys.stdin:

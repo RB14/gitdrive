@@ -13,7 +13,12 @@ from pathlib import Path
 
 from gitdrive.config import GitDriveConfig
 from gitdrive.drive.client import DriveClient
-from gitdrive.exceptions import BundleError, DriveApiError, ManifestError
+from gitdrive.exceptions import (
+    BundleError,
+    DriveApiError,
+    ManifestError,
+    PushRejectedError,
+)
 from gitdrive.remote.helper import Refspec
 from gitdrive.store.manifest import BundleEntry, Manifest, _utcnow_iso
 
@@ -44,6 +49,8 @@ class PushHandler:
     def push(self, refspecs: list[Refspec]) -> list[tuple[Refspec, str | None]]:
         """Push a batch of refspecs.
 
+        A refspec with an empty source deletes its destination ref.
+
         Returns a list of ``(refspec, error_or_none)`` pairs.  A ``None``
         error indicates the push for that refspec succeeded.
         """
@@ -59,11 +66,15 @@ class PushHandler:
 
             for refspec in refspecs:
                 try:
-                    self._push_one(refspec, tmp)
+                    if refspec.src:
+                        self._push_one(refspec, tmp)
+                    else:
+                        self._delete_one(refspec)
                     results.append((refspec, None))
                 except (
                     BundleError,
                     DriveApiError,
+                    PushRejectedError,
                     subprocess.CalledProcessError,
                 ) as exc:
                     results.append((refspec, str(exc)))
@@ -190,6 +201,32 @@ class PushHandler:
             prerequisites=[b.id for b in self._manifest.bundles],
             checksum=f"sha256:{checksum}",
         )
+
+    # ── single-ref deletion ──────────────────────────────────────────
+
+    def _delete_one(self, refspec: Refspec) -> None:
+        """Delete the remote ref *refspec.dst* by dropping it from the manifest.
+
+        Bundles are kept: other refs and the history they carry depend on
+        them.  The ref the remote HEAD points to — the browsable branch —
+        cannot be deleted, as its files are what Drive shows.
+        """
+        if refspec.dst not in self._manifest.refs:
+            raise PushRejectedError("remote ref does not exist")
+
+        if refspec.dst == self._manifest.resolve_browsable_ref():
+            raise PushRejectedError(
+                "refusing to delete the branch the remote HEAD points to; "
+                "switch it first with 'gitdrive browse <branch>'"
+            )
+
+        self._manifest.remove_ref(refspec.dst)
+        self._manifest.updated_at = _utcnow_iso()
+
+        self._msg("  Updating manifest...")
+        self._upload_manifest()
+
+        self._msg(f"  {refspec.dst} deleted")
 
     # ── git helpers ──────────────────────────────────────────────────
 

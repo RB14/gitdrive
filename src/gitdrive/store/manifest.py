@@ -88,6 +88,10 @@ class Manifest:
         """Merge *new_refs* into the current ref map."""
         self.refs.update(new_refs)
 
+    def remove_ref(self, ref: str) -> None:
+        """Drop *ref* from the ref map; bundles are left untouched."""
+        self.refs.pop(ref, None)
+
     def resolve_browsable_ref(self) -> str | None:
         """Return the best browsable ref from available refs.
 

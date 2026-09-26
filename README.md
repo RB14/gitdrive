@@ -18,6 +18,7 @@ No servers, no third-party services — just your code and your Drive.
 - **Clone from Drive** — clone repositories from Google Drive with `gitdrive clone`
 - **Browsable files** — your repository files are synced as real files on Drive, viewable and shareable from the Drive UI
 - **Switchable browsable branch** — choose which branch is shown as browsable files on Drive
+- **Remote ref deletion** — remove branches and tags from Drive with `git push gdrive --delete <ref>`
 - **Incremental bundles** — only changed data is uploaded on each push, keeping transfers fast and storage efficient; a push that brings no new objects (e.g. fast-forwarding a branch onto an already pushed commit) just updates the ref
 - **Encrypted token storage** — OAuth tokens are encrypted at rest using a machine-derived key
 - **Minimal permissions** — requests only the Drive file scope needed to manage GitDrive folders
@@ -191,7 +192,15 @@ git push gdrive main
 
 # Pull from Google Drive on another machine
 git pull gdrive main
+
+# Delete a branch or tag on Drive
+git push gdrive --delete old-feature
 ```
+
+Deleting a ref only removes it from the manifest; the bundles stay, since
+other refs and later bundles may build on them. The branch shown as browsable
+files (the remote `HEAD`) cannot be deleted — switch it first with
+`gitdrive browse <branch>`.
 
 ### 5. Clone from Drive (on another machine)
 
@@ -404,6 +413,7 @@ lightweight tag on a pushed commit — no bundle is created: only the ref in the
 manifest is updated. (An annotated tag always brings its new tag object, so it
 gets a tiny bundle of its own.) A fetch applies every bundle it has not applied
 yet, whichever refs they were created for, so such refs resolve like any other.
+For the same reason, deleting a ref leaves its bundles in the chain.
 
 ### Browsable File Sync
 

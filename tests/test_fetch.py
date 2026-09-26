@@ -48,3 +48,21 @@ def test_fetch_after_ref_only_update_downloads_nothing(repo, remote, tmp_path):
     assert refs["refs/heads/main"] == tip
     assert git("rev-parse", "refs/heads/main", cwd=clone) == tip
     assert len(remote.drive.downloads) == downloads
+
+
+def test_clone_after_deleting_a_ref_whose_bundle_others_build_on(repo, remote, tmp_path):
+    remote.push("refs/heads/main:refs/heads/main")
+    git("checkout", "-q", "-b", "wifi-live")
+    commit("feature.txt")
+    remote.push("refs/heads/wifi-live:refs/heads/wifi-live")
+    git("checkout", "-q", "main")
+    git("merge", "-q", "--ff-only", "wifi-live")
+    remote.push("refs/heads/main:refs/heads/main")  # main's commit is in wifi-live's bundle
+    remote.push(":refs/heads/wifi-live")
+    commit("later.txt")
+    remote.push("refs/heads/main:refs/heads/main")  # needs that commit as a prerequisite
+
+    refs = remote.clone(tmp_path / "clone")
+
+    assert refs == {"refs/heads/main": git("rev-parse", "main")}
+    assert remote.bundle_ids() == ["0001", "0002", "0003"]

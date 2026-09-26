@@ -33,6 +33,10 @@ class BundleVerifyError(BundleError):
     """Raised when git bundle verify fails."""
 
 
+class PushRejectedError(GitDriveError):
+    """Raised when the remote refuses a ref update (e.g. deleting its HEAD)."""
+
+
 class ManifestError(GitDriveError):
     """Raised when manifest parsing or validation fails."""
 

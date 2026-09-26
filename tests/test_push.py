@@ -107,3 +107,56 @@ def test_refs_at_the_same_new_commit_share_one_bundle(repo, remote):
 
     assert remote.manifest().refs == {"refs/heads/main": tip, "refs/heads/copy": tip}
     assert remote.bundle_ids() == ["0001", "0002"]
+
+
+def test_delete_removes_the_ref_and_keeps_the_bundles(repo, remote):
+    remote.push(MAIN)
+    git("checkout", "-q", "-b", "wifi-live")
+    commit("feature.txt")
+    remote.push(WIFI_LIVE)
+
+    assert remote.push(":refs/heads/wifi-live") == {"refs/heads/wifi-live": "ok"}
+
+    assert remote.refs() == {"refs/heads/main": git("rev-parse", "main")}
+    assert remote.bundle_ids() == ["0001", "0002"]
+    assert remote.drive.listing(REPO_NAME, ".gitdrive", "bundles") == [
+        "0001.bundle",
+        "0002.bundle",
+    ]
+
+
+def test_delete_of_the_remote_head_is_refused(repo, remote):
+    remote.push(MAIN)
+    git("branch", "other")
+    remote.push("refs/heads/other:refs/heads/other")
+    before = remote.manifest()
+
+    replies = remote.push(":refs/heads/main", ":refs/heads/other")
+
+    assert replies["refs/heads/main"].startswith(
+        "error refusing to delete the branch the remote HEAD points to"
+    )
+    assert replies["refs/heads/other"] == "ok"
+    assert remote.manifest().refs == {"refs/heads/main": before.refs["refs/heads/main"]}
+    assert remote.head() == "refs/heads/main"
+
+
+def test_delete_of_a_missing_ref_is_rejected(repo, remote):
+    remote.push(MAIN)
+
+    assert remote.push(":refs/heads/nope") == {
+        "refs/heads/nope": "error remote ref does not exist"
+    }
+
+
+def test_recreating_a_deleted_ref_uploads_its_objects_again(repo, remote):
+    remote.push(MAIN)
+    git("checkout", "-q", "-b", "wifi-live")
+    commit("feature.txt")
+    remote.push(WIFI_LIVE)
+    remote.push(":refs/heads/wifi-live")
+
+    assert remote.push(WIFI_LIVE) == {"refs/heads/wifi-live": "ok"}
+
+    # Deleted refs no longer vouch for their objects, so they are re-bundled.
+    assert remote.bundle_ids() == ["0001", "0002", "0003"]
